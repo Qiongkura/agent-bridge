@@ -45,11 +45,28 @@ analysis / risk / next steps  →  接回 ZCode 继续执行
 |---|---|---|---|
 | **Antigravity** | `antigravity` | 对话列表 ✓ 模型列表 ✓ 真实读文件 ✓ | 直连本地 Connect/gRPC-Web RPC，自动发现端口与 CSRF |
 | **任何 ACP 代理** | `acp` | 对话 ✓ 流式 ✓ | Agent Client Protocol，覆盖 DeepSeek Harness、Zed 系代理等 |
-| **任何 CLI 代理** | `cli` | 模型（可配）| 一次调用一个进程：Codex、`claude -p`、自研脚本 |
+| **任何 CLI 代理** | `cli` | 模型（可配）| 一次调用一个进程：Codex、MiMo-Code、`claude -p`、自研脚本 |
 | **新代理** | 新增文件 | — | `src/backends/your.mjs` + 注册表两行 |
 
 `cli` 后端是刻意设计成**零代码扩展点**的：大多数代理都能 `agent --prompt` 或从 stdin 读，
 所以接一个陌生代理往往只要在配置里写清命令、参数模板和输出位置。
+
+### 各代理怎么接
+
+| 工具 | 入口 | 接法 |
+|---|---|---|
+| Antigravity | 桌面应用本地 RPC | `type: "antigravity"`，无需配置 |
+| Codex | `codex exec` | `type: "cli"` + `{prompt}` 参数模板 |
+| DeepSeek Harness | `demo:acp` 脚本 | `type: "acp"` + **自己 provider 的 cordis 配置**（见下）|
+| MiMo-Code | `mimo run` | `type: "cli"`，模型在它自己的 `mimocode.jsonc` 里配 |
+
+**DeepSeek Harness 有个坑**：仓库自带的 `examples/acp-agent/cordis.yml` 硬编码官方直连
+（`provider: deepseek-official`），用你自己的网关会在每轮报
+`no API key for provider route "deepseek-official"`——会话能建，对话必失败。
+模板见 [`examples/dsh-custom-provider.cordis.yml`](examples/dsh-custom-provider.cordis.yml)。
+
+**MiMo-Code 同理**：`mimo run` 没有 `--json` 输出，所以用 `output: "text"`；
+模型不由桥接传参，改它自己的配置文件。
 
 ## 安装
 
@@ -185,6 +202,55 @@ node src/mcp/server.mjs        # stdio JSON-RPC，标准 MCP 协议
 | `jsonPath` | `output:"json"` 时答案所在的字段路径，如 `answer` |
 | `outputFile` | 答案写在该文件里时的路径模板（Codex 的 `--output-last-message`）|
 | `timeoutMs` | 进程超时 |
+
+### 现成的配置片段
+
+**Codex**（`codex exec`，答案同时写文件更可靠）：
+
+```json
+"codex": {
+  "type": "cli",
+  "command": "C:/Users/you/AppData/Local/OpenAI/Codex/bin/<hash>/codex.exe",
+  "args": ["exec", "--skip-git-repo-check", "-s", "read-only"],
+  "stdin": true,
+  "modelArg": ["-m", "{model}"],
+  "outputFile": "{cwd}/.codex-answer.txt",
+  "timeoutMs": 300000
+}
+```
+
+**MiMo-Code**（`mimo run`，无 JSON 输出，模型改它自己的 `mimocode.jsonc`）：
+
+```json
+"mimo": {
+  "type": "cli",
+  "command": "mimo",
+  "args": ["run", "--dangerously-skip-permissions"],
+  "stdin": true,
+  "output": "text",
+  "timeoutMs": 300000
+}
+```
+
+`--dangerously-skip-permissions` 让它在无人值守时不弹确认；这会允许对方直接改文件，
+只想让它做只读审查的话，去 MiMo 自己的配置里收紧权限。
+
+**DeepSeek Harness**（ACP，必须换成你自己的 provider 配置）：
+
+```json
+"deepseek": {
+  "type": "acp",
+  "command": "node",
+  "args": ["--import", "tsx", "packages/examples/acp-demo/src/bin.ts",
+           "--config", "examples/acp-agent/cordis.local.yml"],
+  "cwd": "G:/deepseek-harness",
+  "env": { "MY_GATEWAY_KEY": "<the key>" },
+  "autoApprove": true
+}
+```
+
+`env` 不能省：ACP 入口只读自己 cwd 下的 `.env`，桌面端凭据库里的 key 它看不到。
+`cordis.local.yml` 的模板见 [`examples/dsh-custom-provider.cordis.yml`](examples/dsh-custom-provider.cordis.yml)。
 
 ## 选模型
 

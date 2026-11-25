@@ -45,12 +45,29 @@ analysis / risks / next steps  →  back into ZCode to continue
 |---|---|---|---|
 | **Antigravity** | `antigravity` | conversations ✓ models ✓ reads files ✓ | Direct local Connect/gRPC-Web RPC; discovers port and CSRF token |
 | **Any ACP agent** | `acp` | sessions ✓ streaming ✓ | Agent Client Protocol: DeepSeek Harness, Zed-family agents |
-| **Any CLI agent** | `cli` | models (configurable) | One process per call: Codex, `claude -p`, custom scripts |
+| **Any CLI agent** | `cli` | models (configurable) | One process per call: Codex, MiMo-Code, `claude -p`, custom scripts |
 | **New agent** | new file | — | `src/backends/your.mjs` + two lines in the registry |
 
 The `cli` backend is deliberately a **zero-code extension point**: most agents can be driven by
 `agent --prompt` or by reading stdin, so wiring up an unfamiliar agent is usually just a config
 block describing the command, the argument template, and where the answer lands.
+
+### How each agent connects
+
+| Tool | Entry point | Wiring |
+|---|---|---|
+| Antigravity | desktop app local RPC | `type: "antigravity"`, no config needed |
+| Codex | `codex exec` | `type: "cli"` + a `{prompt}` argument template |
+| DeepSeek Harness | `demo:acp` script | `type: "acp"` + **your own provider's cordis config** (below) |
+| MiMo-Code | `mimo run` | `type: "cli"`; the model lives in its own `mimocode.jsonc` |
+
+**DeepSeek Harness has a trap**: the repo's stock `examples/acp-agent/cordis.yml` hardcodes the
+official endpoint (`provider: deepseek-official`). Point it at your own gateway and every turn fails
+with `no API key for provider route "deepseek-official"` — the session is created, the conversation
+never works. Template: [`examples/dsh-custom-provider.cordis.yml`](examples/dsh-custom-provider.cordis.yml).
+
+**MiMo-Code likewise**: `mimo run` has no `--json` output, so use `output: "text"`, and the model is
+not passed by the bridge — edit its own config file.
 
 ## Install
 
@@ -187,6 +204,56 @@ variables `BRIDGE_ANTIGRAVITY_URL` / `BRIDGE_ANTIGRAVITY_CSRF`) to pin a port.
 | `jsonPath` | Field path holding the answer for `output:"json"`, e.g. `answer` |
 | `outputFile` | Path template when the answer is written to a file (Codex `--output-last-message`) |
 | `timeoutMs` | Process timeout |
+
+### Ready-made config blocks
+
+**Codex** (`codex exec`; writing the answer to a file is more robust):
+
+```json
+"codex": {
+  "type": "cli",
+  "command": "C:/Users/you/AppData/Local/OpenAI/Codex/bin/<hash>/codex.exe",
+  "args": ["exec", "--skip-git-repo-check", "-s", "read-only"],
+  "stdin": true,
+  "modelArg": ["-m", "{model}"],
+  "outputFile": "{cwd}/.codex-answer.txt",
+  "timeoutMs": 300000
+}
+```
+
+**MiMo-Code** (`mimo run`; no JSON output, model comes from its own `mimocode.jsonc`):
+
+```json
+"mimo": {
+  "type": "cli",
+  "command": "mimo",
+  "args": ["run", "--dangerously-skip-permissions"],
+  "stdin": true,
+  "output": "text",
+  "timeoutMs": 300000
+}
+```
+
+`--dangerously-skip-permissions` keeps it from prompting in unattended use — which also lets it edit
+files. To use it as a read-only reviewer, tighten permissions in MiMo's own config.
+
+**DeepSeek Harness** (ACP; must point at your own provider config):
+
+```json
+"deepseek": {
+  "type": "acp",
+  "command": "node",
+  "args": ["--import", "tsx", "packages/examples/acp-demo/src/bin.ts",
+           "--config", "examples/acp-agent/cordis.local.yml"],
+  "cwd": "G:/deepseek-harness",
+  "env": { "MY_GATEWAY_KEY": "<the key>" },
+  "autoApprove": true
+}
+```
+
+The `env` block is not optional: the ACP entry point only loads `.env` from its own cwd, so a key in
+the desktop app's credential store is invisible to it. Template:
+[`examples/dsh-custom-provider.cordis.yml`](examples/dsh-custom-provider.cordis.yml).
 
 ## Choosing a model
 

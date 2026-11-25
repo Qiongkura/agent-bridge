@@ -8,7 +8,7 @@
 import { buildErrorPrompt } from '../src/core/brief.mjs';
 import { converse } from '../src/core/session.mjs';
 import {
-  CONTEXT, configuration, state, commitState, autoBackend, backendLabel, log, quiet, readInput, repairPin, releaseBackends,
+  CALLER, CONTEXT, configuration, state, commitState, autoBackend, backendLabel, log, quiet, readInput, repairPin, releaseBackends,
 } from './_shared.mjs';
 
 async function main() {
@@ -42,7 +42,7 @@ async function main() {
     cwd,
     recent: `工具参数：${JSON.stringify(input.tool_input || {}).slice(0, 2000)}`,
     peer: backendLabel(backend),
-    requester: 'ZCode',
+    requester: CALLER,
   });
 
   let result;
@@ -60,6 +60,7 @@ async function main() {
       ceilingMs: config.auto.errorTimeoutMs,
       context: CONTEXT,
       state: current,
+      caller: CALLER,
       onStateChange: (next) => commitState(next),
       onRepair: repairPin,
     });

@@ -16,6 +16,7 @@ import { spawn } from 'node:child_process';
 import { readFileSync, existsSync, unlinkSync } from 'node:fs';
 
 import { Backend, BridgeError } from '../core/contract.mjs';
+import { childHopEnv } from '../core/lease.mjs';
 
 export class CliBackend extends Backend {
   static get type() {
@@ -68,7 +69,12 @@ export class CliBackend extends Backend {
   // and the answer is available immediately afterwards from wait().
   async send({ conversationId, text, workspace, model } = {}) {
     const opts = this.options;
-    const args = [...(opts.args || [])].map(a => a.replace(/\{prompt\}/g, ''));
+    // Keep the template intact until we know where the prompt goes: an earlier
+    // version stripped {prompt} here, which made the "does any arg carry the
+    // placeholder?" test always false and silently switched every templated
+    // backend to stdin — so `--prompt {prompt}` was passed as `--prompt ""`.
+    const template = [...(opts.args || [])];
+    const args = [...template];
 
     // Model selection: a template lets a backend express how its CLI takes it.
     if (model) {
@@ -80,11 +86,14 @@ export class CliBackend extends Backend {
     }
 
     const cwd = workspace || opts.cwd || process.cwd();
-    const useStdin = opts.stdin === true || args.every(a => !a.includes('{prompt}'));
+    const carriesPrompt = template.some(a => a.includes('{prompt}'));
+    const useStdin = opts.stdin === true || !carriesPrompt;
     if (!useStdin) {
-      // Replace the literal placeholder in-place so flags keep their order.
-      const idx = args.findIndex(a => a.includes('{prompt}'));
-      args[idx] = args[idx].replace('{prompt}', text);
+      // Substitute in place so flags keep their order: the prompt must stay the
+      // value of whatever flag precedes it.
+      for (let i = 0; i < args.length; i += 1) {
+        if (args[i].includes('{prompt}')) args[i] = args[i].replace(/\{prompt\}/g, text);
+      }
     }
 
     const startedAt = Date.now();
@@ -92,7 +101,9 @@ export class CliBackend extends Backend {
       cmd: opts.command,
       args,
       cwd,
-      env: { ...process.env, ...(opts.env || {}) },
+      // Hop propagation: a CLI agent may itself run `bridge ask`; the counter
+      // tells that nested bridge to stop instead of forwarding again.
+      env: { ...childHopEnv(process.env), ...(opts.env || {}) },
       input: useStdin ? text : null,
       timeoutMs: opts.timeoutMs || 600000,
     });
@@ -223,11 +234,31 @@ export class CliBackend extends Backend {
   }
 }
 
-// CLIs that emit a JSONL event stream put the useful answer at the end. Walk the
-// lines and take the last object that has the requested path, so a partially
-// streamed run still yields something.
+// Two output shapes exist in the wild, and a backend must not care which one it
+// got:
+//
+//   * a JSONL event stream (Codex, most `--json` flags): the answer sits in the
+//     last event that has the requested path
+//   * one pretty-printed object on stdout (ZCode's `--json`): valid JSON, but
+//     spread over many lines, so a line-by-line parse finds nothing
+//
+// Trying the whole payload first covers the second case, and the line walk
+// covers the first. Getting this wrong is silent: stdout is non-empty, so the
+// backend would return the raw JSON blob as if it were the agent's prose.
 function parseJsonEvents(stdout, path) {
-  const lines = String(stdout).split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const text = String(stdout).trim();
+  if (!text) return null;
+
+  if (text.startsWith('{') || text.startsWith('[')) {
+    try {
+      const value = readPath(JSON.parse(text), path);
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    } catch {
+      // Not a single JSON document; fall through to the event stream.
+    }
+  }
+
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   let best = null;
   for (const line of lines) {
     if (!line.startsWith('{')) continue;

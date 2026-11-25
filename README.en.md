@@ -45,7 +45,7 @@ analysis / risks / next steps  →  back into ZCode to continue
 |---|---|---|---|
 | **Antigravity** | `antigravity` | conversations ✓ models ✓ reads files ✓ | Direct local Connect/gRPC-Web RPC; discovers port and CSRF token |
 | **Any ACP agent** | `acp` | sessions ✓ streaming ✓ | Agent Client Protocol: DeepSeek Harness, Zed-family agents |
-| **Any CLI agent** | `cli` | models (configurable) | One process per call: Codex, MiMo-Code, `claude -p`, custom scripts |
+| **Any CLI agent** | `cli` | models (configurable) | One process per call: Codex, MiMo-Code, ZCode, `claude -p`, custom scripts |
 | **New agent** | new file | — | `src/backends/your.mjs` + two lines in the registry |
 
 The `cli` backend is deliberately a **zero-code extension point**: most agents can be driven by
@@ -57,9 +57,15 @@ block describing the command, the argument template, and where the answer lands.
 | Tool | Entry point | Wiring |
 |---|---|---|
 | Antigravity | desktop app local RPC | `type: "antigravity"`, no config needed |
+| ZCode | `zcode -p` (headless single turn) | `type: "cli"`, **detected automatically** (below) |
 | Codex | `codex exec` | `type: "cli"` + a `{prompt}` argument template |
 | DeepSeek Harness | `demo:acp` script | `type: "acp"` + **your own provider's cordis config** (below) |
 | MiMo-Code | `mimo run` | `type: "cli"`; the model lives in its own `mimocode.jsonc` |
+
+**ZCode registers itself as a peer**, not as the default target: if `resources/glm/zcode.cjs`
+is found in its install directory, a `zcode` backend is added (`--prompt` + `--json` +
+`--mode plan`, read-only). That is what lets other agents ask *you*. Override the path with
+`ZCODE_CLI_PATH=<…/zcode.cjs>`.
 
 **DeepSeek Harness has a trap**: the repo's stock `examples/acp-agent/cordis.yml` hardcodes the
 official endpoint (`provider: deepseek-official`). Point it at your own gateway and every turn fails
@@ -68,6 +74,49 @@ never works. Template: [`examples/dsh-custom-provider.cordis.yml`](examples/dsh-
 
 **MiMo-Code likewise**: `mimo run` has no `--json` output, so use `output: "text"`, and the model is
 not passed by the bridge — edit its own config file.
+
+## Any two agents, either direction
+
+This is not only "ZCode asks someone else". Two pieces together let any pair talk:
+
+1. **`bin/bridge.mjs` is a standalone CLI.** Any agent that can run a shell command — Codex,
+   MiMo, cron, a git hook — can use it. No MCP required.
+2. **Every backend is detected as a peer**, ZCode included.
+
+```bash
+bridge ask "does this design hold up?" --target codex --caller zcode
+bridge review --file NOTES.md --target zcode --caller codex
+bridge status --json
+```
+
+`--caller` (or `BRIDGE_CALLER`) is who is asking. It does two things: routing **excludes the
+caller** — an agent consulting itself is not a second opinion — and both directions of the same
+pair share one loop guard.
+
+`--target` takes a backend id, or `auto` (the first available peer other than the caller), or
+`random` (a random available peer — with three or more agents this is how you get genuine
+diversity instead of always asking the same one).
+
+### Why loop prevention is mandatory
+
+Two agents that can both call each other will, eventually, call each other forever: A's turn ends
+and asks B to review, B's turn ends and asks A. Three guards, and the first is the one that
+matters:
+
+| Guard | Covers | How |
+|---|---|---|
+| **Lease file** `leases.json` | resident processes | A pair holds a lease while a send is in flight; a concurrent second round is refused. Expires after 5 minutes |
+| `BRIDGE_HOP` env var | subprocesses | incremented on every spawn; a nested bridge refuses to forward again |
+| Self-exclusion | every path | `auto` / `autoBackend` never returns the caller |
+
+**Why env vars alone are not enough**: a resident process (an MCP server, an editor's language
+server) inherits its environment at launch and then lives for days. The parent that set the
+variable is long gone, so for the daemon the variable is invisible — an env-only guard fails
+open, silently. A lease file is cross-process, which is why it is the layer that actually works.
+
+A lease is a **rate limit, not a lock**: it stops the same pair from running two rounds at once,
+not two rounds in sequence. Rejection says how many seconds are left, and it is direction-symmetric
+— A→B and B→A share one lease, or a two-agent ping-pong would look like two innocent pairs.
 
 ## Install
 
@@ -101,6 +150,21 @@ See [Configuration](#configuration).
 | `/antigravity-config` | Status, switch agent, conversation, model, automation |
 
 (The command names keep a historical prefix; they are no longer Antigravity-only.)
+
+Standalone CLI (callable by any agent):
+
+| Command | What it does |
+|---|---|
+| `bridge status [--json]` | Config, online state, active leases, last exchange |
+| `bridge agents [--json]` | Type/online/model count per agent, marking which one is the caller |
+| `bridge ask <question>` | Ask and wait; `--target` picks the peer |
+| `bridge review [summary]` \| `--file <path>` | Submit work for review |
+| `bridge fetch` | Collect the previous answer without resending |
+| `bridge select` | Pin a conversation/model (`--create` starts one) |
+| `bridge leases [--clear]` | Inspect or clear loop-prevention leases |
+
+Exit codes: `0` answered, `3` accepted but still running (call `fetch`), `2` usage or runtime
+error — so a calling agent can branch on them.
 
 ## MCP tools
 
@@ -141,6 +205,7 @@ override with `BRIDGE_DATA_DIR`). Created on first run.
     "review": { "backend": "antigravity", "conversationId": "…" }
   },
   "workspace": "I:\\projects\\my-app",
+  "maxHops": 1,                        // how far a prompt may be forwarded (1 = the peer may not relay)
   "auto": {
     "onStop": false,                   // review every turn end
     "onError": false,                  // ask for help on tool failure
@@ -206,6 +271,23 @@ variables `BRIDGE_ANTIGRAVITY_URL` / `BRIDGE_ANTIGRAVITY_CSRF`) to pin a port.
 | `timeoutMs` | Process timeout |
 
 ### Ready-made config blocks
+
+**ZCode** (detected automatically; this is what it looks like by hand):
+
+```json
+"zcode": {
+  "type": "cli",
+  "name": "ZCode",
+  "command": "C:/Program Files/nodejs/node.exe",
+  "args": ["I:/zcode/resources/glm/zcode.cjs", "--prompt", "{prompt}", "--json", "--mode", "plan"],
+  "output": "json",
+  "jsonPath": "response",
+  "timeoutMs": 300000
+}
+```
+
+`--json` prints **one pretty-printed object** (not JSONL) and the answer is in `response`.
+`--mode plan` keeps it read-only; use `edit` if you want the peer to be able to change files.
 
 **Codex** (`codex exec`; writing the answer to a file is more robust):
 
@@ -402,9 +484,10 @@ BRIDGE_DATA_DIR=/tmp/bridge-test node scripts/smoke-test.mjs
 src/
   core/
     contract.mjs    the Backend contract (single source of truth)
-    registry.mjs    backend registry and instance pool
+    registry.mjs    backend registry, instance pool, target resolution (self-exclusion)
     config.mjs      detection, migration, read/write
-    session.mjs     orchestration, soft wait, tickets
+    session.mjs     orchestration, soft wait, tickets, caller identity
+    lease.mjs       loop prevention: lease file + hop counter
     brief.mjs       prompt construction
   backends/
     antigravity.mjs local RPC
@@ -412,6 +495,8 @@ src/
     cli.mjs         one-shot CLI process
   mcp/
     server.mjs      ten MCP tools
+bin/
+  bridge.mjs        standalone CLI (any agent can call it)
 hooks/
   _shared.mjs       shared hook plumbing (log, state, loop guards)
   stop-bridge.mjs   review on turn end

@@ -17,7 +17,7 @@ import { execFileSync } from 'node:child_process';
 import { buildAutoPrompt } from '../src/core/brief.mjs';
 import { converse } from '../src/core/session.mjs';
 import {
-  CONTEXT, configuration, state, commitState, autoBackend, backendLabel, log, quiet,
+  CALLER, CONTEXT, configuration, state, commitState, autoBackend, backendLabel, log, quiet,
   readInput, readToolTrail, hash, repairPin, releaseBackends,
 } from './_shared.mjs';
 
@@ -100,7 +100,7 @@ async function main() {
     sessionTitle: input.session_title || '',
     toolTrail,
     peer: backendLabel(backend),
-    requester: 'ZCode',
+    requester: CALLER,
   });
 
   let result;
@@ -120,6 +120,7 @@ async function main() {
       ceilingMs: config.auto.timeoutMs,
       context: CONTEXT,
       state: current,
+      caller: CALLER,
       onStateChange: (next) => commitState(next),
       onRepair: repairPin,
     });

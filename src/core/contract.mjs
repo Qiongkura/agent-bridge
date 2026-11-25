@@ -179,6 +179,17 @@ export class Backend {
   async describe() {
     return { type: this.constructor.type, id: this.id };
   }
+
+  /**
+   * Optional: release anything this backend holds — child processes, sockets,
+   * keep-alive connections.
+   *
+   * The registry calls this before a long-lived process exits. Skipping it is not
+   * merely untidy on Windows: a live keep-alive socket during process teardown
+   * trips a libuv assertion (`UV_HANDLE_CLOSING`) and turns a clean exit
+   * into a crash message on a command that already succeeded.
+   */
+  dispose() {}
 }
 
 // Trim a transcript to something a reader can act on, without pretending the

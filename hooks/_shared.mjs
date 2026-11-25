@@ -11,10 +11,15 @@
 import { readFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { defaultDataDir, loadConfig, saveConfig, loadState, saveState } from '../src/core/config.mjs';
-import { loadBackends, disposeBackends } from '../src/core/registry.mjs';
+import { loadBackends, disposeBackends, resolveTarget } from '../src/core/registry.mjs';
+import { callerIdentity } from '../src/core/session.mjs';
 
 export const DATA_DIR = defaultDataDir();
 export const LOG_PATH = join(DATA_DIR, 'hook.log');
+
+// Who the hook speaks for. Under ZCode this is "zcode"; when the same hooks are
+// installed in another host, BRIDGE_CALLER names it.
+export const CALLER = callerIdentity();
 
 // One context for the whole hook process. The `pool` matters: an ACP backend
 // lives in a child process, so the instance that sent the prompt must be the
@@ -98,9 +103,7 @@ export function repairPin({ backend, role, stale, conversationId }) {
     saveConfig({ ...config, ...patch }, { dataDir: DATA_DIR });
     log(`repaired stale conversation pin ${String(stale).slice(0, 8)} -> ${String(conversationId).slice(0, 8)}`);
   }
-}
-
-export function state() {
+}export function state() {
   return loadState({ dataDir: DATA_DIR });
 }
 
@@ -115,22 +118,29 @@ export function commitState(next) {
  * `autoBackend` lets automation point somewhere other than the interactive
  * default — e.g. review with a stronger model on a different agent than the one
  * used for ad-hoc questions.
+ *
+ * The caller is excluded. This is the single most important line in the file for
+ * loop safety: if ZCode is itself registered as a backend, a hook that fires when
+ * ZCode's turn ends and forwards the summary "to ZCode" would start a turn in
+ * ZCode, whose end fires the hook again. Excluding self makes that impossible.
  */
 export async function autoBackend(config) {
   const backends = loadBackends(config, CONTEXT);
   const wanted = config.autoBackend || config.defaultBackend;
-  if (wanted) {
+  if (wanted && wanted !== CALLER) {
     const found = backends.get(wanted);
     if (found) return found;
     // A stale autoBackend (agent uninstalled, id renamed) must not kill the
     // hook: fall through to whatever else is configured.
     log(`autoBackend "${wanted}" is not configured, falling back`);
+  } else if (wanted === CALLER) {
+    log(`autoBackend "${wanted}" is the caller; refusing to send a turn back to itself`);
   }
-  for (const backend of backends.values()) {
-    const check = await backend.available();
-    if (check.ok) return backend;
+  try {
+    return await resolveTarget(backends, 'auto', { caller: CALLER });
+  } catch {
+    return null;
   }
-  return null;
 }
 
 export function backendLabel(backend) {

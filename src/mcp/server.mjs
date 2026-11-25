@@ -10,9 +10,11 @@
 // ticket when the answer is late; see ../core/session.mjs for why.
 import { createInterface } from 'node:readline';
 import { loadConfig, saveConfig, defaultDataDir, loadState, saveState } from '../core/config.mjs';
-import { loadBackends, describeAll, backendTypes, disposeBackends } from '../core/registry.mjs';
-import { converse, redeem, shapeReply, SOFT_WAIT_MS, WAIT_TIMEOUT_DESCRIPTION } from '../core/session.mjs';
+import { loadBackends, describeAll, backendTypes, disposeBackends, resolveTarget } from '../core/registry.mjs';
+import { BridgeError } from '../core/contract.mjs';
+import { converse, redeem, shapeReply, callerIdentity, SOFT_WAIT_MS, WAIT_TIMEOUT_DESCRIPTION } from '../core/session.mjs';
 import { buildBrief, buildSummaryPrompt } from '../core/brief.mjs';
+import { activeLeases } from '../core/lease.mjs';
 
 const DATA_DIR = defaultDataDir();
 // The pool keeps backend instances alive across tool calls: an ACP agent lives
@@ -23,6 +25,11 @@ const CONTEXT = {
   log: (m) => process.stderr.write(`[bridge] ${m}\n`),
   pool: new Map(),
 };
+
+// Who this server speaks for. It defaults to the host's name but can be
+// overridden when a non-ZCode host launches the same MCP server — the tools
+// describe the caller in their prompts and use it to avoid self-targeting.
+const CALLER = callerIdentity();
 
 // ---------------------------------------------------------------- state
 
@@ -84,6 +91,7 @@ tool(
 
     return {
       path: cached.path,
+      caller: CALLER,
       defaultBackend: config.defaultBackend || (available[0] || null),
       available,
       agents,
@@ -97,6 +105,9 @@ tool(
       },
       selected: config.selections,
       roles: config.roles,
+      // A held lease means a collaboration is in flight; seeing one stuck here
+      // is the fastest way to diagnose "why does every call say busy".
+      leases: activeLeases({ dataDir: DATA_DIR }),
       lastExchange: state.lastExchange,
       pending: state.pending,
       knownBackendTypes: backendTypes(),
@@ -297,7 +308,7 @@ tool(
   },
   async ({ prompt, target, conversationId, role, model, timeoutMs, includeContext } = {}) => {
     const config = getConfig();
-    const backend = pickBackend(loadBackends(config, CONTEXT), target || config.defaultBackend);
+    const backend = await pickBackend(loadBackends(config, CONTEXT), target || config.defaultBackend);
     const text = includeContext === false
       ? prompt
       : buildBrief({
@@ -305,7 +316,7 @@ tool(
         cwd: config.workspace || process.cwd(),
         kind: 'question',
         peer: backendLabel(backend),
-        requester: 'ZCode',
+        requester: CALLER,
       });
 
     const result = await converse({
@@ -319,6 +330,7 @@ tool(
       timeoutMs,
       context: CONTEXT,
       state: getState(),
+      caller: CALLER,
       onStateChange: (next) => setState(next),
       onRepair: repairPin,
     });
@@ -347,13 +359,13 @@ tool(
   },
   async ({ summary, request, target, conversationId, role = 'review', model, timeoutMs, cwd } = {}) => {
     const config = getConfig();
-    const backend = pickBackend(loadBackends(config, CONTEXT), target || config.defaultBackend);
+    const backend = await pickBackend(loadBackends(config, CONTEXT), target || config.defaultBackend);
     const prompt = buildSummaryPrompt({
       summary,
       request,
       cwd: cwd || config.workspace || process.cwd(),
       peer: backendLabel(backend),
-      requester: 'ZCode',
+      requester: CALLER,
     });
 
     const result = await converse({
@@ -367,6 +379,7 @@ tool(
       timeoutMs,
       context: CONTEXT,
       state: getState(),
+      caller: CALLER,
       onStateChange: (next) => setState(next),
       onRepair: repairPin,
     });
@@ -421,6 +434,7 @@ tool(
       timeoutMs,
       context: CONTEXT,
       state,
+      caller: CALLER,
       onStateChange: (next) => setState(next),
       onRepair: repairPin,
     });
@@ -545,18 +559,17 @@ function repairPin({ backend, role, stale, conversationId }) {
   if (Object.keys(patch).length) setConfig(patch);
 }
 
-function pickBackend(backends, id) {
-  if (id) {
-    const found = backends.get(id);
-    if (found) return found;
-  }
-  const first = [...backends.values()][0];
-  if (!first) {
-    throw new Error(
+// Resolve a target for a tool call, with the caller's own identity excluded.
+// Using the real resolver (rather than "first backend in the map") means the
+// tools honour "auto" and "random" and refuse to address the agent that asked.
+async function pickBackend(backends, id) {
+  if (!backends.size) {
+    throw new BridgeError(
       '还没有配置任何代理。编辑配置文件的 backends 一节，或先安装一个受支持的客户端。',
+      { code: 'no_backends' },
     );
   }
-  return first;
+  return resolveTarget(backends, id, { caller: CALLER });
 }
 
 function backendLabel(backend) {

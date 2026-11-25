@@ -10,6 +10,7 @@
 // point of this backend is unattended review, not editor integration.
 import { spawn } from 'node:child_process';
 import { Backend, BridgeError } from '../core/contract.mjs';
+import { childHopEnv } from '../core/lease.mjs';
 
 const PROTOCOL_VERSION = 1;
 
@@ -81,7 +82,10 @@ export class AcpBackend extends Backend {
 
     this.child = spawn(cmd, args, {
       cwd: this.options.cwd || process.cwd(),
-      env: { ...process.env, ...(this.options.env || {}) },
+      // Propagate the hop counter so a *nested* bridge invoked by this agent
+      // knows it is nested and refuses to forward again. Without this a chain of
+      // agents turns into a ring.
+      env: { ...childHopEnv(process.env), ...(this.options.env || {}) },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });

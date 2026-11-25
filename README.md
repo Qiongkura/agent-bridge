@@ -45,7 +45,7 @@ analysis / risk / next steps  →  接回 ZCode 继续执行
 |---|---|---|---|
 | **Antigravity** | `antigravity` | 对话列表 ✓ 模型列表 ✓ 真实读文件 ✓ | 直连本地 Connect/gRPC-Web RPC，自动发现端口与 CSRF |
 | **任何 ACP 代理** | `acp` | 对话 ✓ 流式 ✓ | Agent Client Protocol，覆盖 DeepSeek Harness、Zed 系代理等 |
-| **任何 CLI 代理** | `cli` | 模型（可配）| 一次调用一个进程：Codex、MiMo-Code、`claude -p`、自研脚本 |
+| **任何 CLI 代理** | `cli` | 模型（可配）| 一次调用一个进程：Codex、MiMo-Code、ZCode、`claude -p`、自研脚本 |
 | **新代理** | 新增文件 | — | `src/backends/your.mjs` + 注册表两行 |
 
 `cli` 后端是刻意设计成**零代码扩展点**的：大多数代理都能 `agent --prompt` 或从 stdin 读，
@@ -56,9 +56,14 @@ analysis / risk / next steps  →  接回 ZCode 继续执行
 | 工具 | 入口 | 接法 |
 |---|---|---|
 | Antigravity | 桌面应用本地 RPC | `type: "antigravity"`，无需配置 |
+| ZCode | `zcode -p`（无头单次）| `type: "cli"`，**自动探测**（见下）|
 | Codex | `codex exec` | `type: "cli"` + `{prompt}` 参数模板 |
 | DeepSeek Harness | `demo:acp` 脚本 | `type: "acp"` + **自己 provider 的 cordis 配置**（见下）|
 | MiMo-Code | `mimo run` | `type: "cli"`，模型在它自己的 `mimocode.jsonc` 里配 |
+
+**ZCode 会自动注册为对等方**，不占默认目标：探测到安装目录里的
+`resources/glm/zcode.cjs` 就写入一个 `zcode` 后端（`--prompt` + `--json` + `--mode plan`，
+只读）。这样别的代理也能反过来问你。用自己的路径覆盖：`ZCODE_CLI_PATH=<…/zcode.cjs>`。
 
 **DeepSeek Harness 有个坑**：仓库自带的 `examples/acp-agent/cordis.yml` 硬编码官方直连
 （`provider: deepseek-official`），用你自己的网关会在每轮报
@@ -67,6 +72,45 @@ analysis / risk / next steps  →  接回 ZCode 继续执行
 
 **MiMo-Code 同理**：`mimo run` 没有 `--json` 输出，所以用 `output: "text"`；
 模型不由桥接传参，改它自己的配置文件。
+
+## 任意两个代理互通
+
+桥接不只是"ZCode 问别人"。两个机制合起来，任意两个代理都能互相调用：
+
+1. **`bin/bridge.mjs` 是一个独立 CLI。** 任何能跑 shell 命令的代理——Codex、MiMo、
+   cron、git hook——都能用它，不需要 MCP。
+2. **每个后端都会被自动探测成对等方。** ZCode 自己也是其中一个。
+
+```bash
+bridge ask "这个设计站得住吗？" --target codex --caller zcode
+bridge review --file NOTES.md --target zcode --caller codex
+bridge status --json
+```
+
+`--caller` 是发起方身份（也可用 `BRIDGE_CALLER`）。它有两个作用：路由时**排除自己**
+（代理问自己没有第二意见），以及把双向的同一对代理归到同一把锁上。
+
+`--target` 除了 backend id，还接受 `auto`（第一个可用的其他代理）和 `random`
+（在多个可用代理里随机——三个以上代理时这是真正拿到多样性的办法）。
+
+### 为什么必须有防循环
+
+两个能互相调用的代理一定会互相调用到天荒地老：A 一轮结束请 B 审查，B 结束又请 A 审查。
+所以有三层防护，最关键的是第一层：
+
+| 机制 | 覆盖场景 | 说明 |
+|---|---|---|
+| **租约文件** `leases.json` | 常驻进程 | 发送期间持有这对代理的租约，同时第二轮被拒。5 分钟后自动过期 |
+| `BRIDGE_HOP` 环境变量 | 子进程 | 后端 spawn 子进程时 +1；嵌套的桥接拒绝再转发 |
+| 自身排除 | 所有路径 | `auto`/`autoBackend` 永不返回发起方自己 |
+
+**为什么不能只靠环境变量**：一个常驻进程（MCP server、编辑器的语言服务器）在启动时继承
+环境，然后活好几天。父进程早就退出了，它设的环境变量对常驻进程来说是隐形的——所以
+纯 env 方案会静默失效。租约文件是跨进程的，这才是有效的那一层。
+
+租约是**限速**不是锁：它只阻止同一对代理同时跑两轮，不阻止先后两轮。被拒绝时错误信息
+会说明还剩几秒，且方向对称——A→B 和 B→A 共用一把锁，否则一个双人乒乓就是两个互不
+相干的"无辜"配对。
 
 ## 安装
 
@@ -93,6 +137,8 @@ node src/mcp/server.mjs        # stdio JSON-RPC，标准 MCP 协议
 
 ## 命令
 
+ZCode 里的斜杠命令：
+
 | 命令 | 作用 |
 |---|---|
 | `/antigravity-ask <问题>` | 把问题发给协作代理，拿回分析后继续做 |
@@ -100,6 +146,20 @@ node src/mcp/server.mjs        # stdio JSON-RPC，标准 MCP 协议
 | `/antigravity-config` | 看状态、换代理、换对话、换模型、开关自动协作 |
 
 （命令名沿用历史前缀，功能已不限于 Antigravity。）
+
+独立 CLI（任何代理都能调）：
+
+| 命令 | 作用 |
+|---|---|
+| `bridge status [--json]` | 配置、在线状态、当前租约、最近一次协作 |
+| `bridge agents [--json]` | 每个代理的类型/在线/模型数，并标出哪个是发起方自己 |
+| `bridge ask <问题>` | 提问并等待；`--target` 指定对方 |
+| `bridge review [总结]` \| `--file <path>` | 送审 |
+| `bridge fetch` | 取回上一轮的回答，不重新发送 |
+| `bridge select` | 固定对话/模型（`--create` 新建）|
+| `bridge leases [--clear]` | 看/清防循环租约 |
+
+退出码：`0` 已回答、`3` 已受理待 `fetch`、`2` 用法或运行错误。调用方可以据此分支。
 
 ## MCP 工具
 
@@ -139,6 +199,7 @@ node src/mcp/server.mjs        # stdio JSON-RPC，标准 MCP 协议
     "review": { "backend": "antigravity", "conversationId": "…" }
   },
   "workspace": "I:\\projects\\my-app",
+  "maxHops": 1,                        // 最多允许转发几跳（1 = 发起方问一次，对方不得再转）
   "auto": {
     "onStop": false,                   // 每轮结束自动送审
     "onError": false,                  // 工具失败自动求援
@@ -204,6 +265,23 @@ node src/mcp/server.mjs        # stdio JSON-RPC，标准 MCP 协议
 | `timeoutMs` | 进程超时 |
 
 ### 现成的配置片段
+
+**ZCode**（自动探测；手写时是这样）：
+
+```json
+"zcode": {
+  "type": "cli",
+  "name": "ZCode",
+  "command": "C:/Program Files/nodejs/node.exe",
+  "args": ["I:/zcode/resources/glm/zcode.cjs", "--prompt", "{prompt}", "--json", "--mode", "plan"],
+  "output": "json",
+  "jsonPath": "response",
+  "timeoutMs": 300000
+}
+```
+
+`--json` 打印的是**一个美化过的 JSON 对象**（不是 JSONL），答复在 `response` 字段。
+`--mode plan` 让它只读；想让它能改文件就换成 `edit`。
 
 **Codex**（`codex exec`，答案同时写文件更可靠）：
 
@@ -392,9 +470,10 @@ BRIDGE_DATA_DIR=/tmp/bridge-test node scripts/smoke-test.mjs
 src/
   core/
     contract.mjs    Backend 契约（唯一的权威定义）
-    registry.mjs    后端注册与实例池
+    registry.mjs    后端注册、实例池、目标解析（自排除）
     config.mjs      配置探测、迁移、读写
-    session.mjs     会话编排、软等待、票据
+    session.mjs     会话编排、软等待、票据、caller 身份
+    lease.mjs       防循环：租约文件 + hop 计数
     brief.mjs       提示词构造
   backends/
     antigravity.mjs 本地 RPC
@@ -402,6 +481,8 @@ src/
     cli.mjs         一次性 CLI 进程
   mcp/
     server.mjs      10 个 MCP 工具
+bin/
+  bridge.mjs        独立 CLI（任何代理可调用）
 hooks/
   _shared.mjs       hook 公共逻辑（日志、状态、防循环）
   stop-bridge.mjs   回合结束送审

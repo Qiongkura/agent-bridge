@@ -6,7 +6,34 @@
 // paths.
 import { BridgeError, truncate } from './contract.mjs';
 import { loadBackends, resolveTarget } from './registry.mjs';
-import { conversationFor, selectionFor } from './config.mjs';
+import { conversationFor, selectionFor, defaultDataDir } from './config.mjs';
+import { checkHop, checkLease, takeLease } from './lease.mjs';
+
+/**
+ * Who this process is, for routing and loop prevention.
+ *
+ * A caller name is a *role in the conversation*, not a product name: it says
+ * which side of the bridge is talking, so that "auto" can rule itself out and
+ * so two directions of the same pair share one loop guard.
+ *
+ * Resolution order: explicit argument, then the environment (set by whatever
+ * launched this process), then the host's own name.
+ */
+export function callerIdentity(explicit) {
+  const name = explicit || process.env.BRIDGE_CALLER || null;
+  if (name) return sanitizeCaller(name);
+  // Under ZCode the plugin's environment is present; standalone runs fall back
+  // to a neutral name so a bare `bridge ask` still works.
+  if (process.env.ZCODE_PLUGIN_DATA || process.env.CLAUDE_PLUGIN_DATA) return 'zcode';
+  return 'bridge';
+}
+
+function sanitizeCaller(name) {
+  // The caller ends up in a lease file key and in prompts; keep it to something
+  // that cannot confuse either.
+  const clean = String(name).trim().toLowerCase().replace(/[^a-z0-9._-]/g, '-').slice(0, 40);
+  return clean || 'bridge';
+}
 
 // An MCP host kills every tool call at ~30 s. A "send then wait 5 minutes" tool
 // therefore returns nothing at all: the caller is killed before the answer
@@ -99,9 +126,25 @@ export async function converse({
   state = {},
   onStateChange,
   onRepair,
+  // Who is asking. Set from --caller / BRIDGE_CALLER so that a ZCode-hosted
+  // bridge and a Codex-invoked bridge are distinguishable, and so routing can
+  // refuse to send a prompt back to the agent that wrote it.
+  caller = callerIdentity(),
+  // Loop guards are opt-out only for tests; the defaults are the safe ones.
+  guard = true,
+  leaseMs,
 }) {
   const backends = loadBackends(config, context);
-  const backend = await resolveTarget(backends, target || config.defaultBackend);
+  const backend = await resolveTarget(backends, target || config.defaultBackend, { caller });
+
+  if (guard) {
+    const hop = checkHop({ maxHops: config?.maxHops });
+    if (!hop.ok) throw new BridgeError(hop.detail, { code: hop.reason, backend: backend.id });
+
+    const dataDir = context.dataDir || defaultDataDir();
+    const lease = checkLease({ dataDir, caller, target: backend.id, leaseMs });
+    if (!lease.ok) throw new BridgeError(lease.detail, { code: lease.reason, backend: backend.id });
+  }
 
   // Model names are backend-specific: Antigravity wants an enum, Codex wants a
   // provider id. So the per-backend selection wins, and the backend itself is
@@ -128,62 +171,76 @@ export async function converse({
   const before = await backend.read({ conversationId: resolved.id });
   const beforeIndex = (before.turns || []).length;
 
-  await backend.send({
-    conversationId: resolved.id,
-    text: prompt,
-    model: modelRef,
-    workspace: workspace || config.workspace,
-    timeoutMs,
-  });
+  // Hold the lease across the whole exchange, not just the send: the dangerous
+  // window is exactly the time the peer is thinking, because that is when its
+  // own turn may end and trigger a call back.
+  const release = guard
+    ? takeLease({ dataDir: context.dataDir || defaultDataDir(), caller, target: backend.id, leaseMs })
+    : () => {};
 
-  // Record the ticket before waiting: if the host kills this call mid-wait, the
-  // next call still knows a prompt is outstanding and where its answer starts.
-  const tickets = (state.pending || []).filter(p => p.conversationId !== resolved.id);
-  tickets.push({
-    backend: backend.id,
-    conversationId: resolved.id,
-    fromIndex: beforeIndex,
-    sentAt: new Date().toISOString(),
-    promptChars: prompt.length,
-  });
-  onStateChange?.({ ...state, pending: tickets });
+  try {
+    await backend.send({
+      conversationId: resolved.id,
+      text: prompt,
+      model: modelRef,
+      workspace: workspace || config.workspace,
+      timeoutMs,
+    });
 
-  // Callers outside the host's tool budget (hooks, scripts) can wait for minutes;
-  // only the MCP path is clamped. `clampWaitMs` respects an explicit ceiling for
-  // that case, defaulting to the soft MCP budget when none is given.
-  const waitMs = clampWaitMs(timeoutMs, ceilingMs);
-  const result = await backend.wait({
-    conversationId: resolved.id,
-    fromIndex: beforeIndex,
-    timeoutMs: waitMs,
-  });
-
-  const settled = !result.timedOut;
-  onStateChange?.({
-    ...state,
-    pending: settled
-      ? (state.pending || []).filter(p => p.conversationId !== resolved.id)
-      : tickets,
-    lastExchange: {
+    // Record the ticket before waiting: if the host kills this call mid-wait, the
+    // next call still knows a prompt is outstanding and where its answer starts.
+    const tickets = (state.pending || []).filter(p => p.conversationId !== resolved.id);
+    tickets.push({
       backend: backend.id,
       conversationId: resolved.id,
-      at: new Date().toISOString(),
+      fromIndex: beforeIndex,
+      sentAt: new Date().toISOString(),
       promptChars: prompt.length,
-      replyChars: result.reply?.text?.length || 0,
-      status: result.status,
-    },
-  });
+      caller,
+    });
+    onStateChange?.({ ...state, pending: tickets });
 
-  return {
-    ...result,
-    backend: backend.id,
-    conversationId: resolved.id,
-    conversationCreated: !!resolved.created,
-    model: modelRef || null,
-    // Explicit marker so a timeout is never mistaken for an empty answer: the
-    // prompt was accepted, only the wait was cut short.
-    awaitingReply: result.timedOut === true,
-  };
+    // Callers outside the host's tool budget (hooks, scripts) can wait for minutes;
+    // only the MCP path is clamped. `clampWaitMs` respects an explicit ceiling for
+    // that case, defaulting to the soft MCP budget when none is given.
+    const waitMs = clampWaitMs(timeoutMs, ceilingMs);
+    const result = await backend.wait({
+      conversationId: resolved.id,
+      fromIndex: beforeIndex,
+      timeoutMs: waitMs,
+    });
+
+    const settled = !result.timedOut;
+    onStateChange?.({
+      ...state,
+      pending: settled
+        ? (state.pending || []).filter(p => p.conversationId !== resolved.id)
+        : tickets,
+      lastExchange: {
+        backend: backend.id,
+        conversationId: resolved.id,
+        caller,
+        at: new Date().toISOString(),
+        promptChars: prompt.length,
+        replyChars: result.reply?.text?.length || 0,
+        status: result.status,
+      },
+    });
+
+    return {
+      ...result,
+      backend: backend.id,
+      caller,
+      conversationId: resolved.id,
+      conversationCreated: !!resolved.created,
+      model: modelRef || null,
+      // Explicit marker so a timeout is never mistaken for an empty answer: the
+      // prompt was accepted, only the wait was cut short.
+      awaitingReply: result.timedOut === true,
+    };
+  } finally {
+    release();
+  }
 }
 
 /**
@@ -203,9 +260,10 @@ export async function redeem({
   state = {},
   onStateChange,
   context = {},
+  caller = callerIdentity(),
 }) {
   const backends = loadBackends(config, context);
-  const backend = await resolveTarget(backends, target || config.defaultBackend);
+  const backend = await resolveTarget(backends, target || config.defaultBackend, { caller });
 
   const tickets = state.pending || [];
   const id = conversationId

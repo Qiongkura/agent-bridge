@@ -90,6 +90,36 @@ function findAcpCandidates() {
 }
 
 /**
+ * Locate ZCode's headless CLI.
+ *
+ * This matters more than it looks: it is what lets *other* agents consult
+ * ZCode. The desktop app and the CLI share configuration and login, so a machine
+ * running ZCode already has the binary; the bridge only has to find it.
+ *
+ * The bundled CLI is a single .cjs file run by node, not an executable with a
+ * `bin` entry — hence the explicit node invocation in the generated config.
+ */
+function findZcodeCli() {
+  const explicit = process.env.ZCODE_CLI_PATH;
+  if (explicit && existsSync(explicit)) return { script: explicit, node: process.execPath };
+
+  const candidates = [];
+  if (process.env.LOCALAPPDATA) candidates.push(join(process.env.LOCALAPPDATA, 'Programs', 'ZCode', 'resources', 'glm', 'zcode.cjs'));
+  for (const root of [
+    process.env.ZCODE_INSTALL_DIR && join(process.env.ZCODE_INSTALL_DIR, 'resources', 'glm'),
+    'I:\\zcode\\resources\\glm',
+    'C:\\Program Files\\ZCode\\resources\\glm',
+  ]) {
+    if (root) candidates.push(join(root, 'zcode.cjs'));
+  }
+
+  for (const script of candidates) {
+    if (existsSync(script)) return { script, node: process.execPath };
+  }
+  return null;
+}
+
+/**
  * Build the config a first-time user should get.
  *
  * The result is deliberately conservative: agents that were detected are added,
@@ -117,6 +147,30 @@ export function detectConfig({ cwd = process.cwd() } = {}) {
 
   for (const acp of findAcpCandidates()) {
     backends[acp.id] = acp;
+  }
+
+  // ZCode is registered as a *peer*, not as the default. Registering it means
+  // another agent (or a script) can consult it; excluding it from the default
+  // means ZCode does not consult itself. The self-exclusion in resolveTarget is
+  // what makes that safe even when the caller *is* zcode.
+  const zcode = findZcodeCli();
+  if (zcode) {
+    backends.zcode = {
+      type: 'cli',
+      name: 'ZCode',
+      enabled: true,
+      command: zcode.node,
+      // -p runs a single prompt headlessly; --json makes the answer machine
+      // readable. Read-only by default: a peer reviewing your work must not be
+      // able to rewrite it.
+      args: [zcode.script, '--prompt', '{prompt}', '--json', '--mode', 'plan'],
+      stdin: false,
+      output: 'json',
+      // Verified against zcode 0.17.1: --json prints one pretty-printed object
+      // whose `response` field holds the assistant text.
+      jsonPath: 'response',
+      timeoutMs: 300000,
+    };
   }
 
   return {
@@ -229,6 +283,11 @@ export function normalize(raw) {
     roles,
     workspace: raw.workspace || null,
     maxReplyChars: Number(raw.maxReplyChars) || 12000,
+    // How many times a prompt may be forwarded before the bridge refuses.
+    // 1 lets an origin ask once and forbids the peer from asking onwards, which
+    // is what keeps a pair of agents from ringing. Raise it only for a deliberate
+    // chain (A consults B consults C) and accept the longer possible loop.
+    maxHops: Number.isFinite(Number(raw.maxHops)) ? Number(raw.maxHops) : 1,
     auto: {
       onStop: auto.onStop === true,
       onError: auto.onError === true,

@@ -99,8 +99,20 @@ export function disposeBackends(context = {}) {
 // Resolve a target argument. A bare name is a backend id; "auto" or empty means
 // "the first backend that reports itself available", so a fresh install works
 // without any configuration.
-export async function resolveTarget(backends, target) {
-  if (target && target !== 'auto') {
+//
+// `caller` is who is asking. It defaults to this process's own identity, which
+// is how a two-agent setup avoids the degenerate case: if ZCode is itself a
+// configured backend and the request came from ZCode, "auto" must not return
+// ZCode. A model that consults itself is not a second opinion, it is a
+// paraphrase.
+//
+// `"random"` picks a random available peer. With three or more agents that is
+// how you get genuine diversity instead of always consulting the same one.
+export async function resolveTarget(backends, target, { caller = null } = {}) {
+  const self = caller || null;
+  const excludes = (backend) => !self || backend.id !== self;
+
+  if (target && target !== 'auto' && target !== 'random') {
     const found = backends.get(target);
     if (!found) {
       throw new BridgeError(
@@ -108,18 +120,34 @@ export async function resolveTarget(backends, target) {
         { code: 'unknown_backend' },
       );
     }
+    if (!excludes(found)) {
+      throw new BridgeError(
+        `拒绝把自己当协作方：${target} 就是发起方。`
+        + `换一个目标，或用 "auto" 让桥接挑一个别的（当前可用：${[...backends.keys()].filter(id => id !== self).join(', ') || '无'}）。`,
+        { code: 'self_target' },
+      );
+    }
     return found;
   }
 
   const reports = [];
+  const candidates = [];
   for (const backend of backends.values()) {
+    if (!excludes(backend)) continue;
     const check = await backend.available();
-    if (check.ok) return backend;
-    reports.push(`${backend.id}: ${check.detail || 'unavailable'}`);
+    if (check.ok) candidates.push(backend);
+    else reports.push(`${backend.id}: ${check.detail || 'unavailable'}`);
   }
 
+  if (candidates.length) {
+    return target === 'random'
+      ? candidates[Math.floor(Math.random() * candidates.length)]
+      : candidates[0];
+  }
+
+  const skipped = self ? `\n（已排除发起方 ${self}）` : '';
   throw new BridgeError(
-    `no backend is available.\n${reports.join('\n') || 'no backends configured'}`,
+    `no backend is available.\n${reports.join('\n') || 'no backends configured'}${skipped}`,
     { code: 'none_available' },
   );
 }

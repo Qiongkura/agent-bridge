@@ -353,6 +353,25 @@ export class AntigravityBackend extends Backend {
       return { type: this.constructor.type, id: this.id, connected: false, detail: err.message };
     }
   }
+
+  // The RPCs go through the global fetch, whose connection pool keeps sockets
+  // open. Left alone they are still live while the process tears down, which on
+  // Windows trips a libuv assertion after the work has already succeeded.
+  //
+  // Node exposes the pool as a global symbol rather than a documented API, so
+  // this is best-effort by design: if the shape ever changes, disposal is simply
+  // a no-op and the process still exits.
+  async dispose() {
+    try {
+      const sym = Symbol.for('undici.globalDispatcher.1');
+      const dispatcher = globalThis[sym];
+      if (dispatcher && typeof dispatcher.close === 'function') {
+        await dispatcher.close();
+      }
+    } catch {
+      /* best effort */
+    }
+  }
 }
 
 // Resolve a user-typed model reference against the live model list.

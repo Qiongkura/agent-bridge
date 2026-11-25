@@ -2,6 +2,7 @@
 .tmp-test/
 .tmp-hook/
 .tmp-acp/
+.test-data/
 *.log
 
 # Editor / OS noise

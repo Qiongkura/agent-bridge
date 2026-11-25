@@ -1,0 +1,31 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/stop-bridge.mjs"],
+            "timeoutMs": 200000,
+            "statusMessage": "协作代理审查中",            "onError": "allow"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/error-bridge.mjs"],
+            "timeoutMs": 100000,
+            "statusMessage": "协作代理分析失败原因",
+            "onError": "allow"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "zcode-antigravity-bridge",
+  "version": "2.0.0",
+  "description": "多代理协作桥：把 ZCode 的难题与完成总结发给另一个编码代理（Antigravity、Codex、任意 ACP 或 CLI 代理），取回分析与下一步后继续工作。适配器可选，对话与模型可自选。",
+  "author": {
+    "name": "local"
+  },
+  "license": "MIT",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json",
+  "commands": "./commands",
+  "skills": "./skills"
+}

@@ -1,0 +1,11 @@
+# Runtime state written by the bridge itself
+.tmp-test/
+.tmp-hook/
+.tmp-acp/
+*.log
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

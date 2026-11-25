@@ -1,0 +1,48 @@
+{
+  "name": "agent-bridge",
+  "version": "2.1.0",
+  "description": "Any two coding agents can collaborate: a backend-agnostic bridge over MCP, ACP and CLI.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "agent-bridge": "./bin/bridge.mjs",
+    "bridge": "./bin/bridge.mjs"
+  },
+  "exports": {
+    ".": "./src/core/contract.mjs",
+    "./setup": "./src/core/setup.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "hooks/",
+    "commands/",
+    "skills/",
+    "examples/",
+    ".mcp.json",
+    ".zcode-plugin/",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "smoke": "node scripts/smoke-test.mjs",
+    "setup": "node bin/bridge.mjs setup",
+    "status": "node bin/bridge.mjs status"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "mcp",
+    "acp",
+    "codex",
+    "antigravity",
+    "zcode",
+    "collaboration",
+    "code-review"
+  ]
+}

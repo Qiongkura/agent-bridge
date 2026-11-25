@@ -7,6 +7,7 @@ import { AntigravityBackend } from '../backends/antigravity.mjs';
 import { AcpBackend } from '../backends/acp.mjs';
 import { CliBackend } from '../backends/cli.mjs';
 import { BridgeError } from './contract.mjs';
+import { reverseEntry } from './bridge-entry.mjs';
 
 const TYPES = {
   [AntigravityBackend.type]: AntigravityBackend,
@@ -27,7 +28,17 @@ export function createBackend(id, entry, context) {
       { code: 'unknown_backend_type' },
     );
   }
-  return new Impl({ ...entry, id }, context);
+
+  // `reverseServer()` must answer for *this* backend, not for whichever one
+  // created the shared context. Handing the raw context to every instance would
+  // make every ACP peer announce itself under the same caller id, which defeats
+  // self-exclusion: agent A calling back would be recorded as some other agent,
+  // and A could then be asked to review its own work.
+  const scoped = {
+    ...context,
+    reverseServer: () => reverseEntry({ backendId: id, dataDir: context?.dataDir }),
+  };
+  return new Impl({ ...entry, id }, scoped);
 }
 
 /**

@@ -112,6 +112,47 @@ bridge status --json
 会说明还剩几秒，且方向对称——A→B 和 B→A 共用一把锁，否则一个双人乒乓就是两个互不
 相干的"无辜"配对。
 
+### 反向通道怎么建立
+
+CLI 类代理（Codex / MiMo / ZCode）靠子进程里的 `bridge` 命令反向调用，不需要配置。
+ACP 类代理没有 shell，只能通过协议给它的工具集说话——所以要把桥接**作为 MCP server
+交给它**：
+
+```json
+"deepseek": {
+  "type": "acp",
+  "reverseBridge": true,
+  "...": "其余同前"
+}
+```
+
+`reverseBridge: true` 时，`session/new` 会带上一个 stdio MCP server 条目，对方随即拥有
+`bridge_*` 工具，可以再问第三个代理。默认关闭：它扩大了对方能做的事，且每次调用都算你的
+额度。
+
+两件事容易错：
+
+- **`env` 在 ACP 里是数组 `[{name, value}]`**，不是其他配置格式用的对象。写错时多数
+  代理会静默地用空环境启动，于是 `BRIDGE_CALLER` 丢失、回调用无法归因，防循环跟着失效。
+- **`command` 用绝对路径**（`process.execPath` + server 脚本绝对路径）。对端的工作目录
+  不是你的仓库目录。
+
+### 让宿主自动配好反向通道
+
+```bash
+bridge setup --host all --dry-run    # 先看会改什么
+bridge setup --host all              # 写入（每份配置留一个 .bridge-backup）
+```
+
+支持 ZCode / Codex / Claude Code，各自用自己的格式（Codex 是 TOML 的
+`[mcp_servers.X]` + `[mcp_servers.X.env]` 子表）。三条安全规则：
+
+- 文件不存在时**只打印**该粘贴的块，不创建（猜格式比不写更糟）
+- 已有不同内容时不动，除非 `--overwrite`
+- Codex 里已有同名表时**拒绝**改写——在 TOML 里按文本查找表的结尾，误删相邻配置是很容易的
+
+每次真正写入都会留下 `<file>.bridge-backup`。
+
 ## 安装
 
 本仓库是一个 ZCode 插件，同时也能被任何支持 MCP 的宿主当普通 MCP server 用。
@@ -249,6 +290,7 @@ ZCode 里的斜杠命令：
 | `cwd` | 工作目录 |
 | `env` | 追加的环境变量 |
 | `autoApprove` | 自动批准 `session/request_permission`（无人值守必须为 true）|
+| `reverseBridge` | `true` 时把桥接自己作为 MCP server 交给对方，**让 ACP 代理也能反向调用**（见下）|
 | `model` | 仅作展示；ACP 的模型在启动时确定 |
 
 **`cli`**
@@ -451,12 +493,20 @@ export class MyAgentBackend extends Backend {
 ## 自测
 
 ```bash
+npm test                                        # 41 个单元/协议测试，无需任何代理在线
+```
+
+```bash
 node scripts/smoke-test.mjs                     # 只读：状态、代理、模型、对话
 node scripts/smoke-test.mjs ask "问题"           # 真实提问
 node scripts/smoke-test.mjs ask "问题" codex     # 指定后端
 node scripts/smoke-test.mjs full                # 新建对话 + 提问
 node scripts/smoke-test.mjs review              # 真实送审
 ```
+
+`npm test` 覆盖的是那些**出错时不会响**的地方：租约的方向对称性与过期、hop 计数、
+`{prompt}` 占位符的四种走法、目标解析的自排除、以及 ACP 的 `mcpServers` 是否按 schema
+发出（用一个真的子进程跑真 JSON-RPC，而不是 mock 对象）。
 
 用 `BRIDGE_DATA_DIR` 指向临时目录，就不会动到真实配置：
 

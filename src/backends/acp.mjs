@@ -14,6 +14,25 @@ import { childHopEnv } from '../core/lease.mjs';
 
 const PROTOCOL_VERSION = 1;
 
+/**
+ * Convert a bridge entry into ACP's `McpServer` shape.
+ *
+ * ACP requires `env` as an ARRAY of {name, value} — not the object that every
+ * other config format uses. An agent handed the wrong shape usually starts the
+ * server with no environment at all, which loses BRIDGE_CALLER and therefore the
+ * peer's identity: callbacks then arrive unattributed, and self-exclusion stops
+ * working. Exported so this conversion is testable without a live agent.
+ */
+export function toAcpMcpServers(entry) {
+  const env = Object.entries(entry.env || {}).map(([name, value]) => ({ name, value: String(value) }));
+  return [{
+    name: entry.name || 'agent-bridge',
+    command: entry.command,
+    args: entry.args || [],
+    env,
+  }];
+}
+
 export class AcpBackend extends Backend {
   static get type() {
     return 'acp';
@@ -210,16 +229,47 @@ export class AcpBackend extends Backend {
   async #ensureInitialized() {
     if (this.initialized) return;
     this.#ensureProcess();
-    await this.#request('initialize', {
+    const result = await this.#request('initialize', {
       protocolVersion: PROTOCOL_VERSION,
       clientCapabilities: {
         // The bridge only consumes committed assistant text, so it asks for
-        // nothing beyond the baseline: no fs, no terminal, no MCP.
+        // nothing beyond the baseline: no fs, no terminal.
         fs: { readTextFile: false, writeTextFile: false },
         terminal: false,
       },
     }, 30000);
+    // A stdio MCP server is the one transport every ACP agent must support, so
+    // reverse bridging does not depend on which optional transports an agent
+    // implements.
+    this.agentCapabilities = result?.agentCapabilities || {};
     this.initialized = true;
+  }
+
+  /**
+   * The MCP servers to hand the agent on session/new.
+   *
+   * This is what closes the loop. Without it an ACP peer can be *called* but
+   * cannot call back, because the only channel it has is the tool set we give
+   * it — and by default that is empty. With it, the peer sees `bridge_*` tools
+   * and can consult a third agent, which is what makes ACP agents first-class
+   * peers instead of leaves.
+   *
+   * Opt-in per backend (`reverseBridge: true`), because it deliberately widens
+   * what the peer can do: every call it makes is billed to your accounts.
+   */
+  #reverseServers() {
+    if (this.options.reverseBridge !== true) return [];
+
+    const entry = this.context?.reverseServer?.();
+    if (!entry) {
+      // Do not fail the whole call: a peer that cannot call back is still
+      // useful, and a hard error here would make reverse bridging a
+      // prerequisite for any ACP conversation.
+      this.context?.log?.(`acp ${this.id}: reverseBridge requested but no server entry resolved`);
+      return [];
+    }
+
+    return toAcpMcpServers(entry);
   }
 
   async start({ workspace } = {}) {
@@ -227,7 +277,7 @@ export class AcpBackend extends Backend {
     const cwd = workspace || this.options.cwd || process.cwd();
     const result = await this.#request('session/new', {
       cwd,
-      mcpServers: [],
+      mcpServers: this.#reverseServers(),
     }, 60000);
     const sessionId = result?.sessionId;
     if (!sessionId) throw new BridgeError('ACP session/new returned no sessionId', { backend: this.id });

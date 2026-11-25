@@ -27,6 +27,8 @@ import { loadBackends, describeAll, resolveTarget, disposeBackends } from '../sr
 import { converse, redeem, callerIdentity } from '../src/core/session.mjs';
 import { buildBrief, buildSummaryPrompt } from '../src/core/brief.mjs';
 import { activeLeases, clearLeases, currentHop } from '../src/core/lease.mjs';
+import { reverseEntry } from '../src/core/bridge-entry.mjs';
+import { hostTargets, installInto, manualInstructions } from '../src/core/setup.mjs';
 
 const DATA_DIR = defaultDataDir();
 const CONTEXT = { dataDir: DATA_DIR, log: (m) => process.stderr.write(`[bridge] ${m}\n`), pool: new Map() };
@@ -40,6 +42,8 @@ const USAGE = `agent-bridge ${readVersion()}
   bridge review [总结]     [--file <path>] [--request <重点>] [--target <id>]
   bridge fetch   [--conversation <id>] [--target <id>] [--wait]
   bridge select  [--target <id>] [--conversation <id>] [--model <name>] [--create]
+  bridge leases  [--clear]
+  bridge setup   [--host zcode|codex|claude|all] [--dry-run] [--overwrite]
 
 全局选项:
   --caller <name>     你是谁（默认 $BRIDGE_CALLER，否则 zcode/bridge）
@@ -58,7 +62,7 @@ function parseArgs(argv) {
   const args = argv.slice(2);
   const out = { _: [], flags: {} };
   const takesValue = new Set([
-    'target', 'caller', 'role', 'model', 'conversation', 'timeout', 'file', 'request', 'cwd',
+    'target', 'caller', 'role', 'model', 'conversation', 'timeout', 'file', 'request', 'cwd', 'host',
   ]);
 
   for (let i = 0; i < args.length; i += 1) {
@@ -73,8 +77,10 @@ function parseArgs(argv) {
     name = name.replace(/^--?/, '');
 
     if (name === 'h') name = 'help';
-    if (name === 'help' || name === 'json' || name === 'wait' || name === 'create' || name === 'no-guard') {
-      out.flags[name === 'no-guard' ? 'noGuard' : name] = value === null ? true : value !== 'false';
+    if (name === 'help' || name === 'json' || name === 'wait' || name === 'create' || name === 'no-guard'
+      || name === 'dry-run' || name === 'overwrite') {
+      const key = name === 'no-guard' ? 'noGuard' : name === 'dry-run' ? 'dryRun' : name;
+      out.flags[key] = value === null ? true : value !== 'false';
       continue;
     }
     if (takesValue.has(name)) {
@@ -121,14 +127,17 @@ function emit(value, { json }) {
 // optional rather than the only usable mode.
 function render(value) {
   if (value == null) return '';
+  // Arrays may contain pre-rendered prose (setup), so they are joined as blocks
+  // rather than turned into JSON lines: an escaped multi-line string is the one
+  // output shape nobody wants to read.
+  if (Array.isArray(value)) {
+    return value.map(item => (typeof item === 'string' ? item : JSON.stringify(item))).join('\n\n');
+  }
   if (typeof value === 'string') return value;
   if (value.answer !== undefined) {
     const head = `[${value.backend}${value.conversationId ? ` · ${value.conversationId}` : ''}]`;
     const body = value.answer || (value.awaitingReply ? '(仍在生成，用 bridge fetch 取回)' : '(空回复)');
     return `${head}\n\n${body}`;
-  }
-  if (Array.isArray(value)) {
-    return value.map(item => (typeof item === 'string' ? `- ${item}` : JSON.stringify(item))).join('\n');
   }
   return Object.entries(value)
     .map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`)
@@ -314,6 +323,39 @@ function seconds(value) {
   return n * 1000;
 }
 
+/**
+ * Register the bridge with hosts so the reverse channel exists.
+ *
+ * `--host` accepts a name or "all". Running this against `all` is the intended
+ * default behaviour for a new installation: it configures whichever hosts are
+ * actually present and silently skips the rest.
+ */
+async function commandSetup(parsed) {
+  const flags = parsed.flags;
+  const targets = hostTargets();
+  const wanted = flags.host && flags.host !== 'all' ? [flags.host] : Object.keys(targets);
+
+  const unknown = wanted.filter(name => !targets[name]);
+  if (unknown.length) {
+    fail(`未知的 host "${unknown.join(', ')}"。可用：${Object.keys(targets).join(', ')}, all`);
+  }
+
+  const results = [];
+  for (const name of wanted) {
+    const host = targets[name];
+    // Each host is told it speaks as its own id, so a callback from Codex is
+    // attributable to Codex rather than to whichever process installed it.
+    const entry = reverseEntry({ backendId: name, dataDir: DATA_DIR });
+    const result = installInto(host, entry, {
+      dryRun: flags.dryRun === true,
+      overwrite: flags.overwrite === true,
+    });
+    results.push({ host: name, label: host.label, ...result, entry });
+  }
+
+  return results;
+}
+
 // ---------------------------------------------------------------- main
 
 async function main() {
@@ -351,6 +393,11 @@ async function main() {
     case 'select':
       emit(await commandSelect(parsed), { json });
       return 0;
+    case 'setup': {
+      const results = await commandSetup(parsed);
+      emit(renderSetup(results, json), { json });
+      return 0;
+    }
     case 'leases':
       if (parsed.flags.clear) clearLeases({ dataDir: DATA_DIR });
       emit(activeLeases({ dataDir: DATA_DIR }), { json });
@@ -374,6 +421,26 @@ function shape(result, json) {
   if (result.errors?.length) value.errors = result.errors;
   if (json) return value;
   return value;
+}
+
+// Setup output is for a human deciding whether to trust it: say what happened
+// per host, and show the exact block for anything that was not written.
+//
+// "would change" and "did change" are different answers, and conflating them is
+// how a --dry-run ends up looking like it wrote files.
+function renderSetup(results, json) {
+  if (json) return results.map(({ entry, ...rest }) => rest);
+  return results.map((r) => {
+    const head = r.changed
+      ? `✓ ${r.label} 已写入`
+      : r.wouldChange
+        ? `→ ${r.label} 待写入（dry-run，未改动）`
+        : `· ${r.label} 未改动`;
+    const reason = r.reason ? `\n  ${r.reason}` : '';
+    const where = `\n  ${r.path}`;
+    const preview = (r.wouldChange || !r.changed) && r.preview ? `\n\n${r.preview}` : '';
+    return `${head}${reason}${where}${preview}`;
+  }).join('\n\n');
 }
 
 main()

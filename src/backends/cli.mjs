@@ -69,32 +69,8 @@ export class CliBackend extends Backend {
   // and the answer is available immediately afterwards from wait().
   async send({ conversationId, text, workspace, model } = {}) {
     const opts = this.options;
-    // Keep the template intact until we know where the prompt goes: an earlier
-    // version stripped {prompt} here, which made the "does any arg carry the
-    // placeholder?" test always false and silently switched every templated
-    // backend to stdin — so `--prompt {prompt}` was passed as `--prompt ""`.
-    const template = [...(opts.args || [])];
-    const args = [...template];
-
-    // Model selection: a template lets a backend express how its CLI takes it.
-    if (model) {
-      const tpl = opts.modelArg;
-      if (Array.isArray(tpl)) args.push(...tpl.map(a => a.replace(/\{model\}/g, model)));
-      else if (typeof tpl === 'string') args.push(tpl.replace(/\{model\}/g, model));
-    } else if (opts.defaultArgs) {
-      args.push(...opts.defaultArgs);
-    }
-
     const cwd = workspace || opts.cwd || process.cwd();
-    const carriesPrompt = template.some(a => a.includes('{prompt}'));
-    const useStdin = opts.stdin === true || !carriesPrompt;
-    if (!useStdin) {
-      // Substitute in place so flags keep their order: the prompt must stay the
-      // value of whatever flag precedes it.
-      for (let i = 0; i < args.length; i += 1) {
-        if (args[i].includes('{prompt}')) args[i] = args[i].replace(/\{prompt\}/g, text);
-      }
-    }
+    const { args, useStdin } = buildInvocation(opts, { text, model });
 
     const startedAt = Date.now();
     const result = await this.#spawnOnce({
@@ -232,6 +208,42 @@ export class CliBackend extends Backend {
       output: this.options.output || 'text',
     };
   }
+}
+
+/**
+ * Build the argv for one run, and say whether the prompt goes to stdin instead.
+ *
+ * Pure on purpose: the placeholder rules are the part that breaks silently. An
+ * earlier version stripped `{prompt}` from the template *before* testing for it,
+ * so every templated backend appeared to have no placeholder, fell through to
+ * stdin, and ran as `--prompt ""` — the agent then answered an empty question
+ * and the bridge reported a real, useless reply.
+ */
+export function buildInvocation(opts = {}, { text = '', model } = {}) {
+  // Keep the template intact until the destination is known.
+  const template = [...(opts.args || [])];
+  const args = [...template];
+
+  if (model) {
+    const tpl = opts.modelArg;
+    if (Array.isArray(tpl)) args.push(...tpl.map(a => a.replace(/\{model\}/g, model)));
+    else if (typeof tpl === 'string') args.push(tpl.replace(/\{model\}/g, model));
+  } else if (opts.defaultArgs) {
+    args.push(...opts.defaultArgs);
+  }
+
+  const carriesPrompt = template.some(a => a.includes('{prompt}'));
+  const useStdin = opts.stdin === true || !carriesPrompt;
+
+  if (!useStdin) {
+    // Substitute in place so flags keep their order: the prompt has to stay the
+    // value of whatever flag precedes it.
+    for (let i = 0; i < args.length; i += 1) {
+      if (args[i].includes('{prompt}')) args[i] = args[i].replace(/\{prompt\}/g, text);
+    }
+  }
+
+  return { args, useStdin };
 }
 
 // Two output shapes exist in the wild, and a backend must not care which one it

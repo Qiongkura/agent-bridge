@@ -118,6 +118,49 @@ A lease is a **rate limit, not a lock**: it stops the same pair from running two
 not two rounds in sequence. Rejection says how many seconds are left, and it is direction-symmetric
 — A→B and B→A share one lease, or a two-agent ping-pong would look like two innocent pairs.
 
+### Building the reverse channel
+
+CLI agents (Codex, MiMo, ZCode) call back through the `bridge` command inside their subprocess —
+no configuration needed. ACP agents have no shell; the only channel they have is the tool set the
+protocol hands them. So the bridge offers itself **as an MCP server**:
+
+```json
+"deepseek": {
+  "type": "acp",
+  "reverseBridge": true,
+  "...": "everything else as before"
+}
+```
+
+With `reverseBridge: true`, `session/new` carries a stdio MCP server entry and the peer gains the
+`bridge_*` tools, so it can consult a third agent. It is off by default: it widens what the peer can
+do, and every call it makes is billed to your accounts.
+
+Two things are easy to get wrong:
+
+- **In ACP, `env` is an array of `[{name, value}]`**, not the object every other config format uses.
+  Given the wrong shape, most agents start the server with an empty environment — `BRIDGE_CALLER`
+  is lost, callbacks arrive unattributed, and loop prevention quietly stops working.
+- **`command` must be an absolute path** (`process.execPath` plus the absolute server script). The
+  peer's working directory is not your repository.
+
+### Let the hosts configure themselves
+
+```bash
+bridge setup --host all --dry-run    # see what would change first
+bridge setup --host all              # write it (each config keeps a .bridge-backup)
+```
+
+Covers ZCode, Codex and Claude Code, each in its own format (Codex uses TOML
+`[mcp_servers.X]` plus a `[mcp_servers.X.env]` sub-table). Three safety rules:
+
+- A missing config file is **printed, not created** — guessing a schema is worse than not writing
+- An existing, different entry is left alone unless you pass `--overwrite`
+- An existing Codex table is **refused**: finding where a TOML table ends by text means silently
+  deleting a neighbour when you get it wrong
+
+Every real write leaves `<file>.bridge-backup` behind.
+
 ## Install
 
 This repository is a ZCode plugin, and its MCP server also works in any MCP-capable host.
@@ -255,6 +298,7 @@ variables `BRIDGE_ANTIGRAVITY_URL` / `BRIDGE_ANTIGRAVITY_CSRF`) to pin a port.
 | `cwd` | Working directory |
 | `env` | Extra environment variables |
 | `autoApprove` | Auto-approve `session/request_permission` (required for unattended use) |
+| `reverseBridge` | When `true`, hand the bridge to the peer as an MCP server so **ACP agents can call back** (below) |
 | `model` | Display only; ACP picks its model at launch |
 
 **`cli`**
@@ -465,6 +509,10 @@ Config: `$ZCODE_PLUGIN_DATA/config.json`
 ## Self-test
 
 ```bash
+npm test                                        # 41 unit/protocol tests, no agent required
+```
+
+```bash
 node scripts/smoke-test.mjs                     # read-only: status, agents, models, conversations
 node scripts/smoke-test.mjs ask "question"      # real prompt
 node scripts/smoke-test.mjs ask "question" codex # against a specific backend
@@ -472,6 +520,10 @@ node scripts/smoke-test.mjs full                # new conversation + prompt
 node scripts/smoke-test.mjs review              # real review request
 ```
 
+`npm test` covers the places where **failure is silent**: lease symmetry and expiry, hop counting,
+the four ways a `{prompt}` placeholder can resolve, self-exclusion in routing, and whether the ACP
+`mcpServers` payload matches the schema — checked against a real child process speaking real
+JSON-RPC rather than a mocked object.
 Point `BRIDGE_DATA_DIR` at a scratch directory to leave your real config alone:
 
 ```bash

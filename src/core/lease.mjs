@@ -154,11 +154,19 @@ export function takeLease({ dataDir, caller, target, leaseMs = DEFAULT_LEASE_MS,
  * Raise the hop counter for a child process this backend spawns.
  *
  * Merge into the child's env. When the child is another bridge, its own send
- * sees BRIDGE_HOP=1 and refuses to forward again — which is what stops a chain
- * of three agents from becoming a ring.
+ * sees the incremented counter and refuses to forward again — which is what stops
+ * a chain of three agents from becoming a ring.
+ *
+ * The increment is computed from the *base* env when it carries a counter, not
+ * from this process. That matters because callers pass their own environment in:
+ * reading process.env here would silently discard a counter the caller had
+ * deliberately set (a test harness, or a subprocess relaying a chain), and the
+ * child would restart the count from scratch.
  */
 export function childHopEnv(baseEnv = process.env) {
-  return { ...baseEnv, BRIDGE_HOP: String(currentHop() + 1) };
+  const base = Number(baseEnv?.BRIDGE_HOP);
+  const from = Number.isFinite(base) && base > 0 ? base : currentHop();
+  return { ...baseEnv, BRIDGE_HOP: String(from + 1) };
 }
 
 /**

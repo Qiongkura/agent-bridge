@@ -22,7 +22,7 @@
 //   1  runtime error
 import { readFileSync } from 'node:fs';
 
-import { loadConfig, saveConfig, defaultDataDir, loadState, saveState, selectionFor } from '../src/core/config.mjs';
+import { loadConfig, updateConfig, defaultDataDir, loadState, saveState, selectionFor } from '../src/core/config.mjs';
 import { loadBackends, describeAll, resolveTarget, disposeBackends } from '../src/core/registry.mjs';
 import { converse, redeem, callerIdentity } from '../src/core/session.mjs';
 import { buildBrief, buildSummaryPrompt } from '../src/core/brief.mjs';
@@ -298,20 +298,39 @@ async function commandSelect(parsed) {
     fail('没有要设定的内容。用 --conversation / --model / --create 之一。');
   }
 
-  const selection = { ...selectionFor(config, backend.id) };
-  if (conversationId) selection.conversationId = conversationId;
-  if (flags.model) selection.model = await backend.resolveModel(flags.model);
+  // A model given with a conversation is bound to that conversation, not made the
+  // global default — the same rule the MCP tool follows, so the two entry points
+  // cannot disagree about what `select` means.
+  const resolvedModel = flags.model ? await backend.resolveModel(flags.model) : null;
 
-  const next = {
-    ...config,
-    selections: { ...config.selections, [backend.id]: selection },
-    defaultBackend: config.defaultBackend || backend.id,
-  };
-  saveConfig(next, { dataDir: DATA_DIR });
+  const next = await updateConfig((fresh) => {
+    const selection = { ...selectionFor(fresh, backend.id) };
+    const bindings = { ...((fresh.conversationModels || {})[backend.id] || {}) };
+
+    if (conversationId) selection.conversationId = conversationId;
+    if (resolvedModel) {
+      if (conversationId) bindings[conversationId] = resolvedModel;
+      else selection.model = resolvedModel;
+    }
+
+    const patch = {
+      selections: { ...fresh.selections, [backend.id]: selection },
+      defaultBackend: fresh.defaultBackend || backend.id,
+    };
+    if (resolvedModel && conversationId) {
+      patch.conversationModels = {
+        ...(fresh.conversationModels || {}),
+        [backend.id]: bindings,
+      };
+    }
+    return patch;
+  }, { dataDir: DATA_DIR });
 
   return {
     backend: backend.id,
-    selection,
+    selection: selectionFor(next, backend.id),
+    conversationModels: next.conversationModels || {},
+    modelBoundToConversation: Boolean(resolvedModel && conversationId),
     config: path,
     hint: '默认目标也一并固定了，之后的 ask 不带 --target 就会走这里。',
   };

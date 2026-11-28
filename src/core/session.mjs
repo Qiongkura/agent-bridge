@@ -6,7 +6,7 @@
 // paths.
 import { BridgeError, truncate } from './contract.mjs';
 import { loadBackends, resolveTarget } from './registry.mjs';
-import { conversationFor, resolveModelChoice, modelForConversation, defaultDataDir } from './config.mjs';
+import { conversationFor, resolveModelChoice, defaultDataDir } from './config.mjs';
 import { checkHop, checkLease, takeLease } from './lease.mjs';
 
 /**
@@ -251,17 +251,28 @@ export async function converse({
   }
 
   // A pin that the agent no longer knows was replaced above. Persist the repair,
-  // otherwise the same stale id is tried again on the next call.
+  // otherwise the same stale id is tried again on the next call. Awaited because
+  // the repair now goes through the serialised config write; a failure to persist
+  // must not abort an exchange that already has its answer.
   if (resolved.replaced) {
-    onRepair?.({ backend: backend.id, role, stale: resolved.replaced, conversationId: resolved.id });
+    try {
+      await onRepair?.({ backend: backend.id, role, stale: resolved.replaced, conversationId: resolved.id });
+    } catch {
+      /* best effort: the conversation still works, only the pin is stale */
+    }
   }
 
-  // Now that the conversation is known, a model bound to it takes precedence —
-  // that binding is how "this one thread uses a different model" stays scoped to
-  // this thread instead of moving every window that shares the default.
-  const boundModel = modelForConversation(config, backend.id, resolved.id);
-  if (boundModel) {
-    modelRef = await backend.resolveModel(boundModel);
+  // Now that the conversation is known, resolve again with it in hand, using the
+  // same function the user's expectations are built on. A second rule here could
+  // disagree with it; one function means the documented precedence is the only
+  // precedence. An explicit `model` still wins, otherwise a binding applies.
+  const finalChoice = resolveModelChoice(config, backend.id, {
+    conversationId: resolved.id,
+    model,
+    auto,
+  });
+  if (finalChoice && finalChoice !== hint) {
+    modelRef = await backend.resolveModel(finalChoice);
   }
 
   // Count what already exists so wait() can tell new output from history.

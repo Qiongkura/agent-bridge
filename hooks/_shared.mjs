@@ -10,7 +10,7 @@
 //   * resolve the backend from the same config the tools use
 import { readFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { defaultDataDir, loadConfig, saveConfig, loadState, saveState, saveStateMerged } from '../src/core/config.mjs';
+import { defaultDataDir, loadConfig, updateConfig, loadState, saveState, saveStateMerged } from '../src/core/config.mjs';
 import { loadBackends, disposeBackends, resolveTarget } from '../src/core/registry.mjs';
 import { callerIdentity } from '../src/core/session.mjs';
 
@@ -80,29 +80,33 @@ export function configuration() {
 }
 
 export function updateConfiguration(patch) {
-  const next = { ...configuration(), ...patch };
-  saveConfig(next, { dataDir: DATA_DIR });
-  return next;
+  // Re-read inside the write. `configuration()` above is fresh, but a caller that
+  // computed a patch from it and then waited would still write back a stale
+  // neighbouring value.
+  return updateConfig(() => patch, { dataDir: DATA_DIR });
 }
 
 // Same repair the MCP path does: a pinned thread the agent has forgotten must be
 // replaced, or every later automatic forward fails on the stale id.
-export function repairPin({ backend, role, stale, conversationId }) {
-  const config = configuration();
-  const patch = {};
-  const pinned = role ? config.roles?.[role] : null;
-  if (pinned?.conversationId === stale) {
-    patch.roles = { ...config.roles, [role]: { backend, conversationId } };
-  }
-  const selection = { ...(config.selections?.[backend] || {}) };
-  if (selection.conversationId === stale) {
-    selection.conversationId = conversationId;
-    patch.selections = { ...config.selections, [backend]: selection };
-  }
-  if (Object.keys(patch).length) {
-    saveConfig({ ...config, ...patch }, { dataDir: DATA_DIR });
-    log(`repaired stale conversation pin ${String(stale).slice(0, 8)} -> ${String(conversationId).slice(0, 8)}`);
-  }
+//
+// Goes through `updateConfig` rather than writing the snapshot this process read
+// at startup: a hook lives for minutes waiting on a review, and a blind write
+// afterwards would undo whatever another window changed in the meantime.
+export async function repairPin({ backend, role, stale, conversationId }) {
+  await updateConfig((fresh) => {
+    const patch = {};
+    const pinned = role ? fresh.roles?.[role] : null;
+    if (pinned?.conversationId === stale) {
+      patch.roles = { ...fresh.roles, [role]: { backend, conversationId } };
+    }
+    const selection = { ...(fresh.selections?.[backend] || {}) };
+    if (selection.conversationId === stale) {
+      selection.conversationId = conversationId;
+      patch.selections = { ...fresh.selections, [backend]: selection };
+    }
+    return patch;
+  }, { dataDir: DATA_DIR });
+  log(`repaired stale conversation pin ${String(stale).slice(0, 8)} -> ${String(conversationId).slice(0, 8)}`);
 }
 
 export function state() {

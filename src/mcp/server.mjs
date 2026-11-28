@@ -9,7 +9,7 @@
 // Every waiting path is bounded by the host's ~30s tool budget and returns a
 // ticket when the answer is late; see ../core/session.mjs for why.
 import { createInterface } from 'node:readline';
-import { loadConfig, saveConfig, defaultDataDir, loadState, saveState, saveStateMerged } from '../core/config.mjs';
+import { loadConfig, updateConfig, defaultDataDir, loadState, saveState, saveStateMerged } from '../core/config.mjs';
 import { loadBackends, describeAll, backendTypes, disposeBackends, resolveTarget } from '../core/registry.mjs';
 import { BridgeError } from '../core/contract.mjs';
 import { converse, redeem, shapeReply, callerIdentity, normalizePath, SOFT_WAIT_MS, WAIT_TIMEOUT_DESCRIPTION } from '../core/session.mjs';
@@ -33,23 +33,36 @@ const CALLER = callerIdentity();
 
 // ---------------------------------------------------------------- state
 
-let cached = loadConfig({ dataDir: DATA_DIR });
-if (cached.created) {
+// Read the config from disk on every call rather than caching it.
+//
+// Several MCP server processes serve several ZCode windows, and each one used to
+// keep the config it read at startup and write back the whole object. Any edit
+// made in one window was invisible to the others, and the next write from a
+// window holding an older snapshot silently restored its stale values — the same
+// lost-update bug state.json had.
+//
+// Loaded once here only to report first-run detection: creating the file is a
+// side effect worth telling the user about, and doing it during `initialize`
+// means the first tool call does not pay for detection.
+const firstRun = loadConfig({ dataDir: DATA_DIR });
+if (firstRun.created) {
   CONTEXT.log(
-    `wrote a first-run config to ${cached.path} `
-    + `(detected: ${Object.keys(cached.config.backends).join(', ') || 'nothing'})`,
+    `wrote a first-run config to ${firstRun.path} `
+    + `(detected: ${Object.keys(firstRun.config.backends).join(', ') || 'nothing'})`,
   );
 }
 
 function getConfig() {
-  return cached.config;
+  return loadConfig({ dataDir: DATA_DIR }).config;
 }
 
-function setConfig(patch) {
-  const next = { ...getConfig(), ...patch };
-  saveConfig(next, { dataDir: DATA_DIR });
-  cached = { ...cached, config: next, created: false };
-  return next;
+// Re-read, apply the patch, write. `patch` may be a function for the cases where
+// the new value depends on the current one.
+async function setConfig(patch) {
+  return updateConfig(
+    fresh => (typeof patch === 'function' ? patch(fresh) : patch),
+    { dataDir: DATA_DIR },
+  );
 }
 
 function getState() {
@@ -220,9 +233,11 @@ tool(
     type: 'object',
     properties: {
       target: str('默认代理 id（配置里的 backend 名字）。省略则不改'),
-      conversationId: str('对话 ID；传空字符串表示新建一个绑定当前工作区的对话'),
+      conversationId: str('对话 ID。与 model 一起传时模型只作用于那个对话；'
+        + '传空字符串 model 解除该对话的绑定。create:true 时不传表示新建'),
       role: str('用途标签，例如 review / ask / debug。省略则设为全局默认'),
-      model: str('模型：可写 id、显示名或枚举。配合 conversationId 时只作用于那个对话'),
+      model: str('模型：可写 id、显示名或枚举。配合 conversationId 时只作用于那个对话；'
+        + '配合 conversationId 传空字符串表示解除该对话的绑定'),
       autoModel: str('自动协作（Stop hook）时使用的模型；省略则沿用 model'),
       workspace: str('工作区绝对路径；新建对话时绑定它，让代理能读项目文件'),
       create: bool('为 true 时强制新建对话'),
@@ -230,10 +245,6 @@ tool(
     additionalProperties: false,
   },
   async ({ target, conversationId, role, model, autoModel, workspace, create } = {}) => {
-    const patch = {};
-    if (workspace !== undefined) patch.workspace = workspace || null;
-    if (target) patch.defaultBackend = target;
-
     const config = getConfig();
     const backends = loadBackends(config, CONTEXT);
     const backendId = target || config.defaultBackend || [...backends.keys()][0];
@@ -244,79 +255,105 @@ tool(
       );
     }
 
-    // Validate a model before storing it: a typo should fail here, in front of
-    // the user, not at 2am inside an automatic hook.
-    const selection = { ...(config.selections?.[backendId] || {}) };
+    // `model !== undefined` rather than truthiness: an empty string is the
+    // documented way to *remove* a binding, and a truthiness test would silently
+    // treat it as "not provided" and leave the old model in place forever.
+    const clearingBinding = conversationId !== undefined && conversationId !== '' && model === '';
     let resolvedModel = null;
     if (model) {
+      // A typo must fail here, in front of the user, not at 2am inside a hook.
       resolvedModel = await backend.resolveModel(model);
-      // With a conversation named, the model is bound to *that* conversation and
-      // the global default is left alone. This is the difference between "this
-      // review thread should think harder" and "every window changes model".
-      if (conversationId) {
-        patch.conversationModels = {
-          ...config.conversationModels,
-          [backendId]: {
-            ...((config.conversationModels || {})[backendId] || {}),
-            [conversationId]: resolvedModel,
-          },
-        };
-      } else {
-        selection.model = resolvedModel;
-      }
     }
-    if (autoModel) {
-      selection.autoModel = await backend.resolveModel(autoModel);
-    }
+    const resolvedAutoModel = autoModel ? await backend.resolveModel(autoModel) : null;
 
+    // Creating has to happen before the write, because the new conversation's id
+    // is only known afterwards. A model passed with `create` belongs to that new
+    // conversation and must not touch the global default — that would move every
+    // other window to it.
+    let created = null;
     if (create) {
-      const created = await backend.start({
+      created = await backend.start({
         workspace: workspace || config.workspace,
-        model: resolvedModel || selection.model,
+        model: resolvedModel || config.selections?.[backendId]?.model,
       });
-      selection.conversationId = created.id;
-      patch.selections = { ...config.selections, [backendId]: selection };
-      // A model given alongside `create` belongs to the new conversation, not to
-      // every future one. Without this the caller would have to create the
-      // thread and then edit the global default to make it stick.
+    }
+    const targetConversation = created ? created.id : conversationId;
+
+    // One write, computed against the freshest config on disk. `updateConfig`
+    // re-reads immediately before writing, so a window that edited the config a
+    // second ago is not rolled back by this one.
+    const next = await updateConfig((fresh) => {
+      const patch = {};
+      if (workspace !== undefined) patch.workspace = workspace || null;
+      if (target) patch.defaultBackend = target;
+
+      const selection = { ...(fresh.selections?.[backendId] || {}) };
+      const bindingMap = { ...((fresh.conversationModels || {})[backendId] || {}) };
+      const writeBindings = () => {
+        const all = { ...(fresh.conversationModels || {}), [backendId]: bindingMap };
+        // Drop the backend entry rather than leaving `{ backend: {} }` behind: an
+        // empty map is indistinguishable from a stale one when read back.
+        if (!Object.keys(bindingMap).length) delete all[backendId];
+        patch.conversationModels = all;
+      };
+
+      if (resolvedAutoModel) selection.autoModel = resolvedAutoModel;
+
       if (resolvedModel) {
-        patch.conversationModels = {
-          ...config.conversationModels,
-          [backendId]: { ...((config.conversationModels || {})[backendId] || {}), [created.id]: resolvedModel },
-        };
+        if (targetConversation) {
+          bindingMap[targetConversation] = resolvedModel;
+          writeBindings();
+        } else {
+          // Only a bare `model` with nothing to bind it to is a global default.
+          selection.model = resolvedModel;
+        }
       }
-      if (role) patch.roles = { ...config.roles, [role]: { backend: backendId, conversationId: created.id } };
-      const next = setConfig(patch);
+      if (clearingBinding && conversationId in bindingMap) {
+        delete bindingMap[conversationId];
+        writeBindings();
+      }
+
+      if (created) {
+        selection.conversationId = created.id;
+        if (role) patch.roles = { ...fresh.roles, [role]: { backend: backendId, conversationId: created.id } };
+      } else if (conversationId !== undefined && conversationId !== '') {
+        if (role) patch.roles = { ...fresh.roles, [role]: { backend: backendId, conversationId } };
+        else selection.conversationId = conversationId;
+      }
+
+      patch.selections = { ...fresh.selections, [backendId]: selection };
+      return patch;
+    });
+
+    const effectiveModel = targetConversation
+      ? (next.conversationModels?.[backendId]?.[targetConversation]
+        || next.selections?.[backendId]?.model
+        || null)
+      : (next.selections?.[backendId]?.model || null);
+
+    if (created) {
       return {
         backend: backendId,
         conversationId: created.id,
         created: true,
-        model: resolvedModel || selection.model || null,
-        modelBoundToConversation: Boolean(resolvedModel),
+        model: effectiveModel,
+        modelBoundToConversation: Boolean(next.conversationModels?.[backendId]?.[created.id]),
         workspaces: created.workspaces || [],
         selections: next.selections,
-        conversationModels: next.conversationModels,
+        conversationModels: next.conversationModels || {},
+        effectiveModel,
       };
     }
 
-    if (conversationId !== undefined && conversationId !== '') {
-      if (role) patch.roles = { ...config.roles, [role]: { backend: backendId, conversationId } };
-      else selection.conversationId = conversationId;
-    }
-    patch.selections = { ...config.selections, [backendId]: selection };
-
-    const next = setConfig(patch);
     return {
       defaultBackend: next.defaultBackend,
       selections: next.selections,
       roles: next.roles,
       workspace: next.workspace,
-      conversationModels: next.conversationModels,
-      // Say which model this thread will actually use, so a binding that did not
-      // take effect is visible here rather than at the next send.
-      effectiveModel: conversationId
-        ? (next.conversationModels?.[backendId]?.[conversationId] || next.selections?.[backendId]?.model || null)
-        : (next.selections?.[backendId]?.model || null),
+      conversationModels: next.conversationModels || {},
+      // Say which model this thread will actually use. A binding that silently
+      // failed to take effect is otherwise only visible at the next send.
+      effectiveModel,
     };
   },
 );
@@ -523,31 +560,40 @@ tool(
   },
   async ({ onStop, onError, reviewOnStop, continueAfterReview, minEdits, target, model, role } = {}) => {
     const config = getConfig();
-    const auto = { ...config.auto };
-    const patch = { auto };
-    if (onStop !== undefined) auto.onStop = !!onStop;
-    if (onError !== undefined) auto.onError = !!onError;
-    if (reviewOnStop !== undefined) auto.reviewOnStop = !!reviewOnStop;
-    if (continueAfterReview !== undefined) auto.continueAfterReview = !!continueAfterReview;
-    if (minEdits !== undefined) auto.minEdits = Math.max(0, Number(minEdits) || 0);
-    if (role !== undefined) auto.role = role || 'review';
-    if (target !== undefined) patch.autoBackend = target || null;
 
     // An automatic model is validated against the agent that automation actually
     // uses, not the interactive default: they may be different agents.
-    if (model !== undefined) {
-      const backendId = patch.autoBackend || config.autoBackend || config.defaultBackend;
+    let resolvedAutoModel = null;
+    if (model) {
+      const backendId = target || config.autoBackend || config.defaultBackend;
       const backend = loadBackends(config, CONTEXT).get(backendId);
-      if (model && backend) {
-        const selection = { ...(config.selections?.[backendId] || {}) };
-        selection.autoModel = await backend.resolveModel(model);
-        patch.selections = { ...config.selections, [backendId]: selection };
-      } else if (model) {
-        throw new Error(`unknown backend "${backendId}" for autoModel "${model}"`);
-      }
+      if (!backend) throw new Error(`unknown backend "${backendId}" for autoModel "${model}"`);
+      resolvedAutoModel = await backend.resolveModel(model);
     }
 
-    const next = setConfig(patch);
+    // Computed against the freshest config inside the write. Building `auto` from
+    // the snapshot read above would restore every other flag as it was then,
+    // undoing a change another window made meanwhile.
+    const next = await setConfig((fresh) => {
+      const auto = { ...fresh.auto };
+      if (onStop !== undefined) auto.onStop = !!onStop;
+      if (onError !== undefined) auto.onError = !!onError;
+      if (reviewOnStop !== undefined) auto.reviewOnStop = !!reviewOnStop;
+      if (continueAfterReview !== undefined) auto.continueAfterReview = !!continueAfterReview;
+      if (minEdits !== undefined) auto.minEdits = Math.max(0, Number(minEdits) || 0);
+      if (role !== undefined) auto.role = role || 'review';
+
+      const patch = { auto };
+      if (target !== undefined) patch.autoBackend = target || null;
+
+      if (resolvedAutoModel) {
+        const backendId = target || fresh.autoBackend || fresh.defaultBackend;
+        const selection = { ...(fresh.selections?.[backendId] || {}) };
+        selection.autoModel = resolvedAutoModel;
+        patch.selections = { ...fresh.selections, [backendId]: selection };
+      }
+      return patch;
+    });
     const gate = next.auto.minEdits === 0 ? '每轮' : `${next.auto.minEdits} 个文件或新 commit`;
     const autoBackendId = next.autoBackend || next.defaultBackend;
     return {
@@ -601,18 +647,22 @@ tool(
 
 // A pinned conversation the agent has forgotten must not be retried forever.
 // Recording the replacement keeps later calls working without a config edit.
-function repairPin({ backend, role, stale, conversationId }) {
-  const config = getConfig();
-  const patch = {};
-  if (role && config.roles?.[role]?.conversationId === stale) {
-    patch.roles = { ...config.roles, [role]: { backend, conversationId } };
-  }
-  const selection = { ...(config.selections?.[backend] || {}) };
-  if (selection.conversationId === stale) {
-    selection.conversationId = conversationId;
-    patch.selections = { ...config.selections, [backend]: selection };
-  }
-  if (Object.keys(patch).length) setConfig(patch);
+async function repairPin({ backend, role, stale, conversationId }) {
+  // Every check happens inside the write, against the config on disk now. Testing
+  // the snapshot taken before the exchange would miss a newer repair and write
+  // the old pin back — undoing it.
+  await setConfig((fresh) => {
+    const patch = {};
+    if (role && fresh.roles?.[role]?.conversationId === stale) {
+      patch.roles = { ...fresh.roles, [role]: { backend, conversationId } };
+    }
+    const selection = { ...(fresh.selections?.[backend] || {}) };
+    if (selection.conversationId === stale) {
+      selection.conversationId = conversationId;
+      patch.selections = { ...fresh.selections, [backend]: selection };
+    }
+    return patch;
+  });
 }
 
 // Resolve a target for a tool call, with the caller's own identity excluded.

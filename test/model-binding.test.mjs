@@ -36,16 +36,23 @@ test('a conversation binding overrides the default for that thread only', () => 
   assert.equal(resolveModelChoice(c, 'ag', {}), 'DEFAULT');
 });
 
-test('a binding outranks an explicit argument, so it sticks', () => {
-  // Automatic reviews pass no model and must land on the bound one; if an
-  // argument won, a binding would only apply to the single call that set it.
+test('an explicit argument outranks a binding for that one call', () => {
+  // The narrower decision wins: a binding is the standing default for a thread,
+  // an argument is a decision about this call. The reverse order silently ignored
+  // one-off overrides on a bound thread, and it was never needed — the hooks pass
+  // no model at all, so they always fall through to the binding.
   const c = config({
     selections: { ag: { model: 'DEFAULT' } },
     conversationModels: { ag: { 'conv-review': 'NEON_MEDIUM' } },
   });
 
   assert.equal(
-    resolveModelChoice(c, 'ag', { conversationId: 'conv-review', model: 'SOMETHING_ELSE' }),
+    resolveModelChoice(c, 'ag', { conversationId: 'conv-review', model: 'OVERRIDE' }),
+    'OVERRIDE',
+  );
+  // Without an argument the binding still applies, which is what makes it stick.
+  assert.equal(
+    resolveModelChoice(c, 'ag', { conversationId: 'conv-review' }),
     'NEON_MEDIUM',
   );
 });

@@ -352,17 +352,19 @@ export function modelForConversation(config, backendId, conversationId) {
 /**
  * Resolve the model for one call.
  *
- * Order is deliberate. A per-conversation binding outranks an explicit argument
- * because a binding *is* an explicit argument, made once and meant to stick: if
- * the argument won, every automatic stop-hook review into that thread would drop
- * back to the default and the binding would apply only to the call that set it.
- * An explicit argument still outranks the global default, which is what makes a
- * one-off "use the strong model for this question" work.
+ * A binding is the standing default *for that thread*; an explicit argument is a
+ * decision about *this call*. The narrower, more specific thing wins, and that is
+ * the argument, not the binding.
+ *
+ * The reverse was tried first, on the theory that a binding would otherwise stop
+ * applying. It does not: the hooks pass no `model` at all, so they always fall
+ * through to the binding. All that ordering achieved was silently ignoring a
+ * one-off override on a bound thread.
  */
 export function resolveModelChoice(config, backendId, { conversationId, model, auto = false } = {}) {
+  if (model) return model;
   const bound = modelForConversation(config, backendId, conversationId);
   if (bound) return bound;
-  if (model) return model;
   const selection = selectionFor(config, backendId);
   return (auto ? selection.autoModel : null) || selection.model || null;
 }
@@ -395,6 +397,42 @@ export function saveConfig(config, { dataDir = defaultDataDir() } = {}) {
   const path = join(dataDir, 'config.json');
   writeJson(path, config);
   return path;
+}
+
+/**
+ * Read-modify-write against whatever is on disk right now.
+ *
+ * Every MCP server process holds its own copy of the config and rewrites the
+ * whole file. Two windows both calling `bridge_select` therefore race: the
+ * second write is computed from a snapshot taken before the first, so it restores
+ * the first window's old values. The symptom is a binding (or a role, or an
+ * automation flag) that exists, then quietly disappears.
+ *
+ * `mutate` receives the fresh config and returns a patch. Re-reading inside the
+ * call is the point — a caller must never hand in a snapshot it read earlier.
+ *
+ * Writes are serialised within the process. The MCP server does not await one
+ * line before handling the next, so two tool calls in flight can both read, both
+ * write, and the loser's change vanishes. A file lock would cover the
+ * cross-process case too, but config writes are manual and rare while a lock that
+ * can wedge leaves the bridge unusable; this closes the case that actually
+ * happens (one window, two calls) and leaves the rest to last-writer-wins.
+ */
+let writeChain = Promise.resolve();
+
+export function updateConfig(mutate, { dataDir = defaultDataDir(), cwd } = {}) {
+  const run = async () => {
+    const { config } = loadConfig({ dataDir, cwd });
+    const patch = mutate(config) || {};
+    const next = { ...config, ...patch };
+    saveConfig(next, { dataDir });
+    return next;
+  };
+  // Chain rather than await directly: `settled` keeps a rejected write from
+  // poisoning every later one, while the caller still sees the error.
+  const settled = writeChain.then(run, run);
+  writeChain = settled.then(() => {}, () => {});
+  return settled;
 }
 
 // Runtime state (what is in flight, what was already forwarded) is separate from

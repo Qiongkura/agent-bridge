@@ -411,16 +411,26 @@ Precedence, highest first:
 
 | # | Source |
 |---|---|
-| 1 | the model bound to that conversation |
-| 2 | a `model` passed on this call |
+| 1 | a `model` passed on this call |
+| 2 | the model bound to that conversation |
 | 3 | `autoModel` for automation, otherwise `model` |
 
-A binding outranks an explicit argument on purpose: the binding *is* an explicit choice, made once
-and meant to stick. If the argument won, every automatic stop-hook review into that thread would
-fall back to the default and the binding would apply only to the call that set it.
+An explicit argument outranks a binding: a binding is the standing default *for that thread*, an
+argument is a decision about *this call*, and the narrower one wins. The reverse order is not needed
+— the stop and error hooks pass no `model` at all, so they always land on the binding. Letting the
+binding win would only silently ignore a one-off override on a bound thread.
+
+Pass an empty string to remove a binding; the thread falls back to the global default:
+
+```
+bridge_select({conversationId: "e7de37d6-…", model: ""})
+```
 
 `bridge_select({create:true, model:"…"})` binds the model to the conversation it creates, again
-without touching the global default.
+without touching the global default. To change the default, pass no `conversationId`.
+
+`config.json` is re-read and rewritten on every change, serialised within the process, so two windows
+editing config no longer clobber each other — the same lost-update bug `state.json` had.
 
 ## Choosing a conversation
 

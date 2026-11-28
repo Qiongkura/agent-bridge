@@ -29,7 +29,8 @@ async function main() {
     return quiet();
   }
 
-  const cwd = input.cwd || config.workspace || process.cwd();
+  const cwd = input.cwd || process.cwd();
+  const sessionKey = input.session_id || null;
   const backend = await autoBackend(config);
   if (!backend) {
     log('no backend available');
@@ -54,6 +55,7 @@ async function main() {
       role: config.auto.role,
       model: config.autoModel || config.model,
       workspace: cwd,
+      sessionKey,
       // Short leash: the user is waiting on the failed tool call, so we take the
       // first answer that arrives inside this window.
       timeoutMs: config.auto.errorTimeoutMs,

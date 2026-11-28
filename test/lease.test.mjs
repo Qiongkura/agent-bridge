@@ -8,39 +8,40 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  pairKey, checkLease, takeLease, checkHop, childHopEnv, activeLeases, clearLeases, leasePath,
+  directionKey, conversationKey, checkLease, takeLease, checkHop, childHopEnv, activeLeases, clearLeases, leasePath,
 } from '../src/core/lease.mjs';
 
 function scratch() {
   return mkdtempSync(join(tmpdir(), 'bridge-lease-'));
 }
 
-test('pairKey is direction-independent', () => {
-  // A and B calling each other is one conversation. If the key were directional,
-  // a two-agent ping-pong would look like two harmless pairs.
-  assert.equal(pairKey('a', 'b'), pairKey('b', 'a'));
-  assert.notEqual(pairKey('a', 'b'), pairKey('a', 'c'));
-});
-
-test('a held lease blocks the same pair and nothing else', () => {
+test('a held lease blocks only the reverse direction', () => {
   const dataDir = scratch();
-  const release = takeLease({ dataDir, caller: 'a', target: 'b' });
+  const release = takeLease({ dataDir, caller: 'a', target: 'b', conversationId: 'conv-1' });
 
-  assert.equal(checkLease({ dataDir, caller: 'a', target: 'b' }).ok, false);
-  assert.equal(checkLease({ dataDir, caller: 'b', target: 'a' }).ok, false, 'reverse direction');
-  assert.equal(checkLease({ dataDir, caller: 'a', target: 'c' }).ok, true, 'unrelated pair');
-  assert.equal(checkLease({ dataDir, caller: 'c', target: 'b' }).ok, true, 'unrelated pair, other side');
+  // The other side calling back mid-exchange is the loop.
+  assert.equal(checkLease({ dataDir, caller: 'b', target: 'a', conversationId: 'conv-9' }).ok, false);
+  // An unrelated pair is untouched.
+  assert.equal(checkLease({ dataDir, caller: 'a', target: 'c' }).ok, true);
 
   release();
-  assert.equal(checkLease({ dataDir, caller: 'a', target: 'b' }).ok, true);
+  assert.equal(checkLease({ dataDir, caller: 'b', target: 'a' }).ok, true);
+});
+
+test('directionKey and conversationKey name different things', () => {
+  assert.notEqual(directionKey('a', 'b'), directionKey('b', 'a'));
+  // A conversation key is per backend, so the same id under two agents is not
+  // the same thread and must not block across them.
+  assert.notEqual(conversationKey('x', 'c1'), conversationKey('y', 'c1'));
 });
 
 test('a lease expires instead of wedging the bridge forever', () => {
   const dataDir = scratch();
   takeLease({ dataDir, caller: 'a', target: 'b', leaseMs: 1000, now: 0 });
 
-  assert.equal(checkLease({ dataDir, caller: 'a', target: 'b', now: 500 }).ok, false);
-  assert.equal(checkLease({ dataDir, caller: 'a', target: 'b', now: 1500 }).ok, true);
+  // 'a' calling 'b' is now allowed by design; the reverse is what expires.
+  assert.equal(checkLease({ dataDir, caller: 'b', target: 'a', now: 500 }).ok, false);
+  assert.equal(checkLease({ dataDir, caller: 'b', target: 'a', now: 1500 }).ok, true);
 });
 
 test('checkLease prunes expired entries rather than accumulating them', () => {
@@ -64,11 +65,11 @@ test('a stale release does not remove a lease another process now holds', () => 
   const dataDir = scratch();
   const release = takeLease({ dataDir, caller: 'a', target: 'b' });
 
-  // Another process takes over the pair after ours expires (simulated by
-  // rewriting the owner). Our late release must not clear their lease: that
-  // would let two overlapping runs believe they are exclusive.
+  // Another process takes over after ours expired (simulated by rewriting the
+  // owner). Our late release must not clear their lease: that would let two
+  // overlapping runs believe they are exclusive.
   const file = JSON.parse(readFileSync(leasePath(dataDir), 'utf8'));
-  const key = pairKey('a', 'b');
+  const key = directionKey('a', 'b');
   file[key].pid = process.pid + 1;
   file[key].expiresAt = Date.now() + 60000;
   writeFileSync(leasePath(dataDir), JSON.stringify(file));
@@ -76,7 +77,7 @@ test('a stale release does not remove a lease another process now holds', () => 
   release();
 
   assert.equal(activeLeases({ dataDir }).length, 1, 'foreign lease still held');
-  assert.equal(checkLease({ dataDir, caller: 'a', target: 'b' }).ok, false);
+  assert.equal(checkLease({ dataDir, caller: 'b', target: 'a' }).ok, false);
 });
 
 test('hop counting stops a nested call and allows a fresh one', () => {
@@ -111,4 +112,54 @@ test('clearLeases removes the file', () => {
   takeLease({ dataDir, caller: 'a', target: 'b' });
   clearLeases({ dataDir });
   assert.deepEqual(activeLeases({ dataDir }), []);
+});
+
+test('two conversations may run in parallel in the same direction', () => {
+  // The pair-only lease used to block every window as soon as two were open:
+  // window A waiting on a review killed window B's unrelated request. A single
+  // window asking two questions is not a loop, so this must be allowed.
+  const dataDir = scratch();
+  const first = takeLease({ dataDir, caller: 'a', target: 'b', conversationId: 'conv-1' });
+
+  assert.equal(
+    checkLease({ dataDir, caller: 'a', target: 'b', conversationId: 'conv-2' }).ok,
+    true,
+    'same direction, different conversation: independent work',
+  );
+
+  first();
+  assert.equal(checkLease({ dataDir, caller: 'a', target: 'b', conversationId: 'conv-2' }).ok, true);
+});
+
+test('a second run into the same conversation is refused', () => {
+  const dataDir = scratch();
+  const release = takeLease({ dataDir, caller: 'a', target: 'b', conversationId: 'conv-1' });
+
+  const blocked = checkLease({ dataDir, caller: 'a', target: 'b', conversationId: 'conv-1' });
+  assert.equal(blocked.ok, false);
+
+  release();
+  assert.equal(checkLease({ dataDir, caller: 'a', target: 'b', conversationId: 'conv-1' }).ok, true);
+});
+
+test('a reverse call is blocked even when the conversations differ', () => {
+  // This is the loop guard proper: A is talking to B, and B tries to talk back.
+  // Which threads they use is irrelevant to the hazard.
+  const dataDir = scratch();
+  const release = takeLease({ dataDir, caller: 'a', target: 'b', conversationId: 'conv-a' });
+
+  const reverse = checkLease({ dataDir, caller: 'b', target: 'a', conversationId: 'conv-b' });
+  assert.equal(reverse.ok, false);
+  assert.equal(reverse.reason, 'lease_held');
+
+  release();
+});
+
+test('releasing clears both keys it took', () => {
+  const dataDir = scratch();
+  const release = takeLease({ dataDir, caller: 'a', target: 'b', conversationId: 'conv-1' });
+  assert.equal(activeLeases({ dataDir }).length, 2, 'pair key plus conversation key');
+
+  release();
+  assert.equal(activeLeases({ dataDir }).length, 0);
 });

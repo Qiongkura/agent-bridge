@@ -58,49 +58,103 @@ export const WAIT_TIMEOUT_DESCRIPTION =
 /**
  * Resolve which conversation to talk to on a given backend.
  *
- * Order: explicit id, the role's pinned conversation (if it belongs to this
- * backend), the backend's own sticky conversation, the newest conversation
- * already rooted at the workspace, then a new one. That last step is what makes
- * a fresh install useful without configuration.
+ * The rule that matters: **never guess by looking at conversations the bridge
+ * did not create.** An earlier version fell back to the newest conversation in
+ * the agent (`existing[0]`) whenever the workspace did not match, which meant
+ * every ZCode session on the machine poured its topic into one Antigravity
+ * thread. Two unrelated projects shared one context window, and the answers got
+ * worse the more you used it.
  *
- * A pinned id is *discarded* when the backend no longer knows it — agents
- * garbage-collect old threads, and a stale pin would otherwise make every later
- * call fail with "trajectory not found". Reusing the current pin only helps if
- * it still exists.
+ * So the order is narrow on purpose:
+ *
+ *   1. an explicit id from the caller
+ *   2. the mapping this session (or workspace) was given earlier
+ *   3. a global pin — only when there is no session and no workspace to key on
+ *   4. create a new conversation
+ *
+ * Everything the bridge chooses is recorded in `state`, keyed by the session it
+ * belongs to. Automatic choices are *never* written back to `config.selections`:
+ * that file is shared by every window, so writing there would recreate exactly
+ * the bug this function exists to prevent.
  */
-async function resolveConversation(backend, config, { conversationId, role, workspace, model }) {
+export async function resolveConversation(backend, config, { conversationId, role, workspace, model, sessionKey, state, onStateChange }) {
   if (conversationId) return { id: conversationId, created: false };
 
-  const existing = await backend.listConversations();
-  const known = new Set(existing.map(c => String(c.id)));
+  // What the agent still knows. Used only to *validate* a mapping we already
+  // made — never to pick one. An empty list means the backend cannot enumerate
+  // (CLI backends), in which case our mapping is all we have.
+  let known = new Set();
+  try {
+    known = new Set((await backend.listConversations()).map(c => String(c.id)));
+  } catch {
+    known = new Set();
+  }
+  const alive = id => known.size === 0 || known.has(String(id));
 
-  const pinned = conversationFor(config, backend.id, role);
-  if (pinned && (known.size === 0 || known.has(String(pinned)))) {
-    return { id: pinned, created: false };
+  const backendId = backend.id;
+  const normWs = workspace ? normalizePath(workspace) : null;
+
+  // 2a. This ZCode session's own mapping.
+  if (sessionKey) {
+    const mapped = state?.sessionConversations?.[backendId]?.[sessionKey];
+    if (mapped && alive(mapped)) {
+      return { id: mapped, created: false, reused: true, source: 'session' };
+    }
   }
 
-  if (existing.length) {
-    const wanted = workspace ? normalizePath(workspace) : null;
-    const match = wanted
-      ? existing.find(c => (c.workspaces || []).some(w => normalizePath(String(w)).includes(wanted)))
-      : null;
-    const chosen = match || existing[0];
-    return {
-      id: chosen.id,
-      created: false,
-      reused: true,
-      title: chosen.title,
-      // Tell the caller the pin was stale so it can be repaired.
-      replaced: pinned || null,
-    };
+  // 2b. A workspace mapping — but only for a caller that has no session identity
+  // of its own (an MCP tool call, a script). If a sessionKey was supplied, the
+  // workspace shortcut is exactly what would merge two windows on one project
+  // back into a single thread, so it is skipped.
+  if (normWs && !sessionKey) {
+    const mapped = state?.workspaceConversations?.[backendId]?.[normWs];
+    if (mapped && alive(mapped)) {
+      return { id: mapped, created: false, reused: true, source: 'workspace' };
+    }
   }
 
+  // 3. A deliberate global pin, but only when there is nothing narrower to key
+  // on. With a sessionKey present the pin is exactly the thing that would
+  // collapse every window into one thread, so it is skipped.
+  if (!sessionKey && !normWs) {
+    const pinned = conversationFor(config, backendId, role);
+    if (pinned && alive(pinned)) return { id: pinned, created: false, source: 'config' };
+  }
+
+  // 4. Nothing matched: make a new one and record it against this session and
+  // workspace.
   const created = await backend.start({ workspace, model });
-  return { id: created.id, created: true, replaced: pinned || null };
+  remember(onStateChange, state, backendId, sessionKey, normWs, created.id);
+  return { id: created.id, created: true };
 }
 
-function normalizePath(p) {
-  return String(p || '').replace(/\\/g, '/').toLowerCase();
+// Record a mapping without touching config: state is per-install observation,
+// config is the user's deliberate choice, and conflating them is what made every
+// window share one conversation.
+function remember(onStateChange, state, backendId, sessionKey, normWs, id) {
+  if (!onStateChange) return;
+  const next = { ...state };
+  if (sessionKey) {
+    next.sessionConversations = {
+      ...(next.sessionConversations || {}),
+      [backendId]: { ...((next.sessionConversations || {})[backendId] || {}), [sessionKey]: id },
+    };
+  }
+  if (normWs) {
+    next.workspaceConversations = {
+      ...(next.workspaceConversations || {}),
+      [backendId]: { ...((next.workspaceConversations || {})[backendId] || {}), [normWs]: id },
+    };
+  }
+  onStateChange(next);
+}
+
+// One normalisation for workspace paths, used both to store a mapping and to
+// look it up later. Two implementations would drift, and a key that is written
+// one way and read another means every lookup misses — which looks exactly like
+// "the mapping feature does not work".
+export function normalizePath(p) {
+  return String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 }
 
 /**
@@ -119,6 +173,11 @@ export async function converse({
   model,
   workspace,
   timeoutMs,
+  // Which host session is asking (ZCode's session_id, or any stable per-window
+  // id). This is what keeps two windows from sharing one conversation: without
+  // it there is nothing to distinguish them, and the safe fallback is to make a
+  // new conversation rather than reuse someone else's.
+  sessionKey = null,
   // How long this caller is allowed to block. Omitted means "the MCP soft
   // budget"; hooks pass their own, much larger, limit.
   ceilingMs,
@@ -141,8 +200,9 @@ export async function converse({
     const hop = checkHop({ maxHops: config?.maxHops });
     if (!hop.ok) throw new BridgeError(hop.detail, { code: hop.reason, backend: backend.id });
 
-    const dataDir = context.dataDir || defaultDataDir();
-    const lease = checkLease({ dataDir, caller, target: backend.id, leaseMs });
+    // The reverse lease does not need a conversation: A→B while B is already
+    // calling A is a loop no matter which threads are involved.
+    const lease = checkLease({ dataDir: context.dataDir || defaultDataDir(), caller, target: backend.id, leaseMs });
     if (!lease.ok) throw new BridgeError(lease.detail, { code: lease.reason, backend: backend.id });
   }
 
@@ -157,9 +217,29 @@ export async function converse({
   const resolved = await resolveConversation(backend, config, {
     conversationId,
     role,
-    workspace: workspace || config.workspace,
+    // No `|| config.workspace` here: a global workspace from config would make
+    // every window look like the same workspace, which is the other half of the
+    // cross-talk bug. The caller's own cwd is the truth.
+    workspace,
     model: modelRef,
+    sessionKey,
+    state,
+    onStateChange,
   });
+
+  // The collision check has to come after resolution: only now is it known which
+  // conversation this run will write into. Two windows working in different
+  // threads must be allowed to proceed in parallel.
+  if (guard) {
+    const lease = checkLease({
+      dataDir: context.dataDir || defaultDataDir(),
+      caller,
+      target: backend.id,
+      conversationId: resolved.id,
+      leaseMs,
+    });
+    if (!lease.ok) throw new BridgeError(lease.detail, { code: lease.reason, backend: backend.id });
+  }
 
   // A pin that the agent no longer knows was replaced above. Persist the repair,
   // otherwise the same stale id is tried again on the next call.
@@ -175,7 +255,13 @@ export async function converse({
   // window is exactly the time the peer is thinking, because that is when its
   // own turn may end and trigger a call back.
   const release = guard
-    ? takeLease({ dataDir: context.dataDir || defaultDataDir(), caller, target: backend.id, leaseMs })
+    ? takeLease({
+      dataDir: context.dataDir || defaultDataDir(),
+      caller,
+      target: backend.id,
+      conversationId: resolved.id,
+      leaseMs,
+    })
     : () => {};
 
   try {

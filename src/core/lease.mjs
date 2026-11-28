@@ -58,15 +58,6 @@ function writeLeases(path, leases) {
   }
 }
 
-// The identity of a "pair". Direction matters: A→B and B→A are the same
-// conversation and must share a lease, otherwise a two-agent ping-pong is two
-// distinct pairs that each look innocent.
-export function pairKey(a, b) {
-  const left = String(a || 'unknown');
-  const right = String(b || 'unknown');
-  return [left, right].sort().join('|');
-}
-
 /**
  * Read the hop count for this process.
  *
@@ -81,11 +72,26 @@ export function currentHop() {
 /**
  * Decide whether this send may proceed.
  *
+ * Two different hazards, deliberately keyed differently:
+ *
+ *   * **A loop.** A→B then B→A is the dangerous shape, so a *reverse* lease
+ *     (target calling back to caller) blocks regardless of which conversation
+ *     either side is using. This is the guard that actually prevents infinite
+ *     ping-pong.
+ *   * **A collision.** Two runs writing into the *same* conversation will
+ *     interleave turns. That is per conversation, so this check is keyed by
+ *     `backend:conversationId`.
+ *
+ * An earlier version keyed only by the pair, which deadlocked every window as
+ * soon as two were open: window A waiting on a review made window B's unrelated
+ * request in a different conversation fail with `lease_held`. Correct scope
+ * matters more here than a bigger number.
+ *
  * Returns { ok: true } or { ok: false, reason, detail } — never throws. A guard
  * that can throw is a guard that turns a loop into an error the user has to
  * debug.
  */
-export function checkLease({ dataDir, caller, target, now = Date.now(), leaseMs = DEFAULT_LEASE_MS }) {
+export function checkLease({ dataDir, caller, target, conversationId = null, now = Date.now(), leaseMs = DEFAULT_LEASE_MS }) {
   const path = leasePath(dataDir);
   const leases = readLeases(path);
 
@@ -99,51 +105,101 @@ export function checkLease({ dataDir, caller, target, now = Date.now(), leaseMs 
   }
   if (pruned) writeLeases(path, leases);
 
-  const key = pairKey(caller, target);
-  const held = leases[key];
-  if (held) {
-    const seconds = Math.max(1, Math.round((held.expiresAt - now) / 1000));
+  // 1. Reverse lease: the other side is already calling *us*. That is a loop in
+  // progress, whatever conversations are involved.
+  //
+  // Only the reverse direction is checked. Re-checking our own direction would
+  // block a single window that legitimately has two questions out to the same
+  // agent at once — which is not a loop, and on a busy machine is normal.
+  const reverse = leases[directionKey(target, caller)];
+  if (reverse) {
+    const seconds = Math.max(1, Math.round((reverse.expiresAt - now) / 1000));
     return {
       ok: false,
       reason: 'lease_held',
-      detail: `${held.caller} 和 ${held.target} 之间已有一轮协作在进行中（还剩 ${seconds} 秒）。`
+      detail: `${reverse.caller} 和 ${reverse.target} 之间已有一轮协作在进行中（还剩 ${seconds} 秒）。`
         + '两个代理互相调用会形成环，所以并发的第二轮被拒绝。等这一轮结束再试。',
     };
+  }
+
+  // 2. Same-conversation collision: two runs into one thread would interleave.
+  if (conversationId) {
+    const key = conversationKey(target, conversationId);
+    const held = leases[key];
+    if (held) {
+      const seconds = Math.max(1, Math.round((held.expiresAt - now) / 1000));
+      return {
+        ok: false,
+        reason: 'conversation_busy',
+        detail: `${target} 的对话 ${String(conversationId).slice(0, 8)} 正有一轮请求在途（还剩 ${seconds} 秒）。`
+          + '同一对话并发的两轮会互相插话；不同对话可以并行。',
+      };
+    }
   }
 
   return { ok: true, path, leases };
 }
 
 /**
+ * Lease key for one direction of a pair.
+ *
+ * Direction has to be part of the key. The hazard is *mutual* recursion (A→B and
+ * B→A at the same time), not the same caller issuing two requests — a single
+ * window legitimately asks about two different threads, and an unordered pair
+ * key cannot tell those apart from a loop.
+ */
+export function directionKey(caller, target) {
+  return `dir:${caller || 'unknown'}->${target || 'unknown'}`;
+}
+
+/** Lease key for "this conversation is busy". */
+export function conversationKey(backendId, conversationId) {
+  return `conv:${backendId}:${conversationId}`;
+}
+
+/**
  * Take the lease. Call this immediately before sending, after checkLease passed.
+ *
+ * Records the outbound direction (so a callback can detect the loop) and, when
+ * known, the conversation (so two runs cannot interleave in one thread). A
+ * second request in the same direction to a *different* conversation is allowed:
+ * that is two windows doing their own work, not a loop.
  *
  * Returns a release() function. Releasing early is good hygiene but not
  * required: the lease expires on its own.
  */
-export function takeLease({ dataDir, caller, target, leaseMs = DEFAULT_LEASE_MS, now = Date.now() }) {
+export function takeLease({ dataDir, caller, target, conversationId = null, leaseMs = DEFAULT_LEASE_MS, now = Date.now() }) {
   const path = leasePath(dataDir);
   const leases = readLeases(path);
-  const key = pairKey(caller, target);
+  const keys = [directionKey(caller, target)];
+  if (conversationId) keys.push(conversationKey(target, conversationId));
 
-  leases[key] = {
-    caller,
-    target,
-    takenAt: new Date(now).toISOString(),
-    expiresAt: now + leaseMs,
-    pid: process.pid,
-  };
+  for (const key of keys) {
+    leases[key] = {
+      caller,
+      target,
+      conversationId: conversationId || null,
+      takenAt: new Date(now).toISOString(),
+      expiresAt: now + leaseMs,
+      pid: process.pid,
+    };
+  }
   writeLeases(path, leases);
 
   return function release() {
     try {
       const current = readLeases(path);
-      // Only remove it if it is still ours: another process may have taken the
-      // lease after ours expired, and stealing the release would let two
-      // overlapping runs exist.
-      if (current[key] && current[key].pid === process.pid) {
-        delete current[key];
-        writeLeases(path, current);
+      let changed = false;
+      for (const key of keys) {
+        // Only remove it if it is still ours: another process may have taken the
+        // lease after ours expired, and stealing the release would let two
+        // overlapping runs exist.
+        if (current[key] && current[key].pid === process.pid) {
+          delete current[key];
+          changed = true;
+        }
       }
+      if (changed) writeLeases(path, current);
     } catch {
       /* best effort */
     }

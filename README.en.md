@@ -398,15 +398,36 @@ Selections are **stored per backend**: one agent's model name means nothing to a
 
 ```
 bridge_conversations                     # see what exists
-bridge_select({conversationId})          # pick one
+bridge_select({conversationId})          # pin one
 bridge_select({create:true, workspace})  # start one bound to a workspace
 ```
 
-Binding a workspace is what lets the other agent read that directory. With nothing selected, the
-bridge reuses the newest conversation already bound to the current project.
+### One conversation per session
 
-If a pinned conversation was garbage-collected by the agent, the bridge **replaces it with a usable
-one and writes the repair back** instead of failing forever with `trajectory not found`.
+With nothing pinned, the bridge picks in this order — earlier wins:
+
+1. an explicit `conversationId` — use it
+2. this ZCode session's own mapping (keyed by `session_id`) — use it
+3. the current working directory's mapping — **only for a caller with no session identity**
+   (a script, the CLI)
+4. a pinned conversation from config — **only when neither of the above applies**
+
+If none matches it starts a new one and records it in `state.json` — **never in `config.json`**.
+
+That distinction is the whole point: `config.json` is shared by every window. An automatically
+chosen conversation written there is read by the next window too, so two unrelated projects end up
+in one thread and their contents mix. Automatic mappings therefore live only in `state.json`
+(`sessionConversations` / `workspaceConversations`), per session and per directory. A conversation
+pinned in `config.json` only ever means the user chose it by hand.
+
+Two windows on the same project are also two separate conversations: a session's own identity
+outranks the workspace mapping, otherwise "same project" merges the windows back together.
+Different conversations may run in parallel; two concurrent runs into the *same* conversation are
+refused (they would interleave), as is a reverse call (B calling back while A→B is in flight).
+
+If the pinned conversation was garbage-collected by the agent, the bridge **starts a new one** and
+updates that session's mapping in `state.json` — it does not fail forever with `trajectory not found`,
+and it does not hand you someone else's thread.
 
 ## Keeping automation affordable
 

@@ -8,7 +8,8 @@
             "command": "node",
             "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/stop-bridge.mjs"],
             "timeoutMs": 200000,
-            "statusMessage": "协作代理审查中",            "onError": "allow"
+            "statusMessage": "协作代理审查中",
+            "onError": "allow"
           }
         ]
       }

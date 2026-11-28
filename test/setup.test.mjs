@@ -25,7 +25,7 @@ test('dry-run reports the change without writing it', () => {
   const path = join(dir, 'settings.json');
   writeFileSync(path, JSON.stringify({ other: true }, null, 2));
 
-  const result = installInto({ label: 'T', kind: 'json', path, key: 'mcpServers' }, ENTRY, { dryRun: true });
+  const result = installInto({ label: 'T', kind: 'json', path, keyPath: ['mcpServers'] }, ENTRY, { dryRun: true });
 
   assert.equal(result.changed, false);
   assert.equal(result.wouldChange, true);
@@ -38,7 +38,7 @@ test('JSON install adds its key and preserves everything else', () => {
   const original = { theme: 'dark', mcpServers: { existing: { command: 'x' } } };
   writeFileSync(path, JSON.stringify(original, null, 2));
 
-  const result = installInto({ label: 'T', kind: 'json', path, key: 'mcpServers' }, ENTRY);
+  const result = installInto({ label: 'T', kind: 'json', path, keyPath: ['mcpServers'] }, ENTRY);
 
   assert.equal(result.changed, true);
   const next = JSON.parse(readFileSync(path, 'utf8'));
@@ -51,7 +51,7 @@ test('a second identical run is a no-op', () => {
   const dir = scratch();
   const path = join(dir, 'settings.json');
   writeFileSync(path, '{}');
-  const host = { label: 'T', kind: 'json', path, key: 'mcpServers' };
+  const host = { label: 'T', kind: 'json', path, keyPath: ['mcpServers'] };
 
   installInto(host, ENTRY);
   const again = installInto(host, ENTRY);
@@ -67,7 +67,7 @@ test('a conflicting entry is left alone without --overwrite', () => {
     mcpServers: { 'agent-bridge': { command: 'someone-elses' } },
   }));
 
-  const result = installInto({ label: 'T', kind: 'json', path, key: 'mcpServers' }, ENTRY);
+  const result = installInto({ label: 'T', kind: 'json', path, keyPath: ['mcpServers'] }, ENTRY);
 
   assert.equal(result.changed, false);
   assert.match(result.reason, /overwrite/);
@@ -80,7 +80,7 @@ test('invalid JSON is reported, never rewritten', () => {
   const path = join(dir, 'settings.json');
   writeFileSync(path, '{ this is not json');
 
-  const result = installInto({ label: 'T', kind: 'json', path, key: 'mcpServers' }, ENTRY);
+  const result = installInto({ label: 'T', kind: 'json', path, keyPath: ['mcpServers'] }, ENTRY);
 
   assert.equal(result.changed, false);
   assert.equal(readFileSync(path, 'utf8'), '{ this is not json', 'left exactly as found');
@@ -90,7 +90,7 @@ test('a missing config file is not created from thin air', () => {
   const dir = scratch();
   const path = join(dir, 'nope.json');
 
-  const result = installInto({ label: 'T', kind: 'json', path, key: 'mcpServers' }, ENTRY);
+  const result = installInto({ label: 'T', kind: 'json', path, keyPath: ['mcpServers'] }, ENTRY);
 
   assert.equal(result.changed, false);
   assert.equal(existsSync(path), false);
@@ -131,15 +131,55 @@ test('every write leaves one backup', () => {
   const path = join(dir, 'settings.json');
   writeFileSync(path, '{}');
 
-  installInto({ label: 'T', kind: 'json', path, key: 'mcpServers' }, ENTRY);
+  installInto({ label: 'T', kind: 'json', path, keyPath: ['mcpServers'] }, ENTRY);
 
   assert.equal(existsSync(`${path}.bridge-backup`), true);
 });
 
-test('hostTargets covers the hosts that were actually verified', () => {
-  const targets = hostTargets({ homedir: '/home/u' });
+test('hostTargets points at the paths that were actually verified', () => {
+  const targets = hostTargets({ homedir: '/home/u', appData: 'C:/Users/u/AppData/Roaming' });
+
   assert.deepEqual(Object.keys(targets).sort(), ['claude', 'codex', 'zcode']);
+
+  // ZCode nests its servers under mcp.servers in the CLI config. An earlier
+  // version of this file guessed settings.json plus a flat mcpServers key, which
+  // would have written a file ZCode never reads.
+  assert.deepEqual(targets.zcode.keyPath, ['mcp', 'servers']);
+  assert.match(targets.zcode.path.replace(/\\/g, '/'), /\.zcode\/cli\/config\.json$/);
+
+  // Claude Desktop's documented Windows location, not Claude Code's settings.
+  assert.deepEqual(targets.claude.keyPath, ['mcpServers']);
+  assert.match(targets.claude.path.replace(/\\/g, '/'), /Roaming\/Claude\/claude_desktop_config\.json$/);
+
   assert.equal(targets.codex.kind, 'toml');
+});
+
+test('a nested key path is written without disturbing siblings', () => {
+  const dir = scratch();
+  const path = join(dir, 'config.json');
+  writeFileSync(path, JSON.stringify({
+    plugins: { enabledPlugins: { 'a@b': true } },
+    mcp: { servers: { existing: { command: 'x' } }, otherSetting: 1 },
+  }, null, 2));
+
+  installInto({ label: 'T', kind: 'json', path, keyPath: ['mcp', 'servers'] }, ENTRY);
+
+  const next = JSON.parse(readFileSync(path, 'utf8'));
+  assert.deepEqual(next.mcp.servers.existing, { command: 'x' }, 'sibling server kept');
+  assert.equal(next.mcp.otherSetting, 1, 'sibling setting kept');
+  assert.equal(next.mcp.servers['agent-bridge'].env.BRIDGE_CALLER, 'codex');
+  assert.equal(next.plugins.enabledPlugins['a@b'], true, 'unrelated top-level key kept');
+});
+
+test('a nested key path creates missing intermediate objects', () => {
+  const dir = scratch();
+  const path = join(dir, 'config.json');
+  writeFileSync(path, '{}');
+
+  installInto({ label: 'T', kind: 'json', path, keyPath: ['mcp', 'servers'] }, ENTRY);
+
+  const next = JSON.parse(readFileSync(path, 'utf8'));
+  assert.ok(next.mcp.servers['agent-bridge']);
 });
 
 test('manual instructions stay self-contained for an agent that cannot ask', () => {

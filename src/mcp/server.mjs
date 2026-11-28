@@ -9,10 +9,10 @@
 // Every waiting path is bounded by the host's ~30s tool budget and returns a
 // ticket when the answer is late; see ../core/session.mjs for why.
 import { createInterface } from 'node:readline';
-import { loadConfig, saveConfig, defaultDataDir, loadState, saveState } from '../core/config.mjs';
+import { loadConfig, saveConfig, defaultDataDir, loadState, saveState, saveStateMerged } from '../core/config.mjs';
 import { loadBackends, describeAll, backendTypes, disposeBackends, resolveTarget } from '../core/registry.mjs';
 import { BridgeError } from '../core/contract.mjs';
-import { converse, redeem, shapeReply, callerIdentity, SOFT_WAIT_MS, WAIT_TIMEOUT_DESCRIPTION } from '../core/session.mjs';
+import { converse, redeem, shapeReply, callerIdentity, normalizePath, SOFT_WAIT_MS, WAIT_TIMEOUT_DESCRIPTION } from '../core/session.mjs';
 import { buildBrief, buildSummaryPrompt } from '../core/brief.mjs';
 import { activeLeases } from '../core/lease.mjs';
 
@@ -57,8 +57,10 @@ function getState() {
 }
 
 function setState(next) {
-  saveState(next, { dataDir: DATA_DIR });
-  return next;
+  // Merge rather than overwrite: a tool call can block for most of a minute, and
+  // writing its pre-call snapshot back would discard a conversation mapping
+  // another window created while it waited.
+  return saveStateMerged(next, { dataDir: DATA_DIR });
 }
 
 // ---------------------------------------------------------------- transport
@@ -302,18 +304,24 @@ tool(
       model: str('本次使用的模型，省略则用默认'),
       timeoutMs: num(WAIT_TIMEOUT_DESCRIPTION),
       includeContext: bool('保留参数：附加本机环境与工作区信息'),
+      // Without this a tool call has no idea which project it belongs to, so the
+      // bridge could only key conversations on a global setting — which is what
+      // made every window share one thread.
+      cwd: str('本会话的工作区绝对路径；用于把本会话绑定到独立的对方对话'),
+      sessionKey: str('本会话的稳定标识（如 ZCode 的 session_id）；不同会话不会共用对话'),
     },
     required: ['prompt'],
     additionalProperties: false,
   },
-  async ({ prompt, target, conversationId, role, model, timeoutMs, includeContext } = {}) => {
+  async ({ prompt, target, conversationId, role, model, timeoutMs, includeContext, cwd, sessionKey } = {}) => {
     const config = getConfig();
     const backend = await pickBackend(loadBackends(config, CONTEXT), target || config.defaultBackend);
+    const workspace = cwd || config.workspace || process.cwd();
     const text = includeContext === false
       ? prompt
       : buildBrief({
         request: prompt,
-        cwd: config.workspace || process.cwd(),
+        cwd: workspace,
         kind: 'question',
         peer: backendLabel(backend),
         requester: CALLER,
@@ -326,7 +334,8 @@ tool(
       role,
       conversationId,
       model,
-      workspace: config.workspace,
+      workspace,
+      sessionKey,
       timeoutMs,
       context: CONTEXT,
       state: getState(),
@@ -352,18 +361,20 @@ tool(
       role: str('默认使用 review 角色对话'),
       model: str('本次使用的模型'),
       timeoutMs: num(WAIT_TIMEOUT_DESCRIPTION),
-      cwd: str('工作区路径，用于告知对方去哪里看代码'),
+      cwd: str('工作区路径，用于告知对方去哪里看代码，并绑定本会话的对方对话'),
+      sessionKey: str('本会话的稳定标识；不同会话不会共用对话'),
     },
     required: ['summary'],
     additionalProperties: false,
   },
-  async ({ summary, request, target, conversationId, role = 'review', model, timeoutMs, cwd } = {}) => {
+  async ({ summary, request, target, conversationId, role = 'review', model, timeoutMs, cwd, sessionKey } = {}) => {
     const config = getConfig();
     const backend = await pickBackend(loadBackends(config, CONTEXT), target || config.defaultBackend);
+    const workspace = cwd || config.workspace || process.cwd();
     const prompt = buildSummaryPrompt({
       summary,
       request,
-      cwd: cwd || config.workspace || process.cwd(),
+      cwd: workspace,
       peer: backendLabel(backend),
       requester: CALLER,
     });
@@ -375,7 +386,8 @@ tool(
       role,
       conversationId,
       model,
-      workspace: cwd || config.workspace,
+      workspace,
+      sessionKey,
       timeoutMs,
       context: CONTEXT,
       state: getState(),
@@ -400,10 +412,12 @@ tool(
       sinceTurns: num('只取最后 N 轮，默认 4'),
       wait: bool('为 true 时强制等待其空闲（最多等 timeoutMs）'),
       timeoutMs: num(WAIT_TIMEOUT_DESCRIPTION),
+      cwd: str('本会话的工作区；用于找到本会话自己的对话，而不是别的窗口的'),
+      sessionKey: str('本会话的稳定标识；优先于 cwd'),
     },
     additionalProperties: false,
   },
-  async ({ target, conversationId, role, sinceTurns, wait, timeoutMs } = {}) => {
+  async ({ target, conversationId, role, sinceTurns, wait, timeoutMs, cwd, sessionKey } = {}) => {
     const config = getConfig();
     const state = getState();
     const pending = state.pending || [];
@@ -413,8 +427,19 @@ tool(
     // A ticket may belong to a review-thread conversation that is not the global
     // default, so try role and the newest pending ticket before falling back.
     // Otherwise a bare fetch() silently polls the wrong thread.
+    //
+    // The conversation this session was given comes first: "newest pending
+    // ticket" is a global guess, and with two windows open it returns the other
+    // window's thread.
     const rolePin = role ? config.roles?.[role] : null;
+    const mine = sessionKey
+      ? state.sessionConversations?.[effectiveTarget]?.[sessionKey]
+      : (cwd
+        ? state.workspaceConversations?.[effectiveTarget]?.[normalizePath(cwd)]
+        : null);
+
     const id = conversationId
+      || mine
       || (rolePin && (!rolePin.backend || rolePin.backend === effectiveTarget)
         ? rolePin.conversationId
         : null)
@@ -643,7 +668,7 @@ rl.on('line', async (line) => {
     respond(id, {
       protocolVersion: params?.protocolVersion || '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'agent-bridge', version: '2.0.0' },
+      serverInfo: { name: 'agent-bridge', version: '2.1.0' },
       instructions:
         '用这些工具让另一个代理参与协作：bridge_ask 提问，bridge_review 请它审查完成总结，'
         + 'bridge_fetch 取回回复，bridge_auto 开关每轮自动协作。先 bridge_status 确认哪个代理在线，'

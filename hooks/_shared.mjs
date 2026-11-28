@@ -10,7 +10,7 @@
 //   * resolve the backend from the same config the tools use
 import { readFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { defaultDataDir, loadConfig, saveConfig, loadState, saveState } from '../src/core/config.mjs';
+import { defaultDataDir, loadConfig, saveConfig, loadState, saveState, saveStateMerged } from '../src/core/config.mjs';
 import { loadBackends, disposeBackends, resolveTarget } from '../src/core/registry.mjs';
 import { callerIdentity } from '../src/core/session.mjs';
 
@@ -103,13 +103,17 @@ export function repairPin({ backend, role, stale, conversationId }) {
     saveConfig({ ...config, ...patch }, { dataDir: DATA_DIR });
     log(`repaired stale conversation pin ${String(stale).slice(0, 8)} -> ${String(conversationId).slice(0, 8)}`);
   }
-}export function state() {
+}
+
+export function state() {
   return loadState({ dataDir: DATA_DIR });
 }
 
+// Merge into what is on disk instead of overwriting with a snapshot taken
+// seconds ago: a hook waits for a whole review, and a blind write afterwards
+// would undo anything another window wrote meanwhile.
 export function commitState(next) {
-  saveState(next, { dataDir: DATA_DIR });
-  return next;
+  return saveStateMerged(next, { dataDir: DATA_DIR });
 }
 
 /**

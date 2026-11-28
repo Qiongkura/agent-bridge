@@ -356,6 +356,65 @@ export function saveState(state, opts) {
   writeJson(statePath(opts), state);
 }
 
+/**
+ * Save only the keys that changed, against whatever is on disk right now.
+ *
+ * A conversation exchange takes tens of seconds, and the caller holds the
+ * `state` object it read before it started. Writing that whole object back
+ * afterwards restores every field as it was then, silently undoing whatever
+ * another window wrote in between — including the conversation mappings that
+ * keep two sessions apart. That is how a cross-talk fix turns into cross-talk
+ * again under concurrency.
+ *
+ * Merging is applied per top-level key. `pending` is a list, so it is replaced
+ * rather than merged: a partial merge would resurrect redeemed tickets.
+ */
+export function saveStateMerged(patch, opts) {
+  const current = loadState(opts);
+  const next = { ...current };
+  for (const [key, value] of Object.entries(patch || {})) {
+    if (value === undefined) continue;
+    if (isPlainObject(value) && isPlainObject(current[key])) {
+      next[key] = mergeMaps(current[key], value, MAP_KEYS.has(key) ? 2 : 1);
+    } else {
+      next[key] = value;
+    }
+  }
+  writeJson(statePath(opts), next);
+  return next;
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * State keys whose *second* level is also written by independent callers.
+ *
+ * `sessionConversations` is `{ backend: { session: conversation } }`. Two
+ * windows write different sessions of the same backend concurrently, so merging
+ * only one level replaces the whole backend map and window A's late write drops
+ * window B's thread — the exact cross-talk these maps exist to prevent.
+ *
+ * This is an allowlist rather than a blanket deep merge because snapshot keys
+ * must be replaced whole: recursively merging `lastReview` leaves fields from
+ * the previous review behind and yields a review that never happened.
+ */
+const MAP_KEYS = new Set(['sessionConversations', 'workspaceConversations', 'lastForwarded', 'lastSeenCommit']);
+
+function mergeMaps(current, patch, depth) {
+  const out = { ...current };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) continue;
+    if (depth > 1 && isPlainObject(value) && isPlainObject(current[key])) {
+      out[key] = mergeMaps(current[key], value, depth - 1);
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
 // Read-modify-write in one helper, so a caller cannot accidentally drop the
 // fields it did not touch.
 export function updateState(mutate, opts) {

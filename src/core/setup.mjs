@@ -20,20 +20,27 @@ import { mcpServerBlock } from './bridge-entry.mjs';
 const SERVER_NAME = 'agent-bridge';
 
 /**
- * Where each known host keeps its MCP configuration.
+ * Where each host keeps its MCP configuration.
  *
- * These are conventions, not contracts: a host that moves its file simply ends
- * up in the "unknown" branch, which prints the block for the user to paste.
+ * Every path and key here was verified against either the host's own docs or the
+ * host's real config on disk — an earlier version guessed at two of them and got
+ * both wrong (ZCode is `mcp.servers` in cli/config.json, not `mcpServers` in
+ * settings.json; Claude Desktop is claude_desktop_config.json under %APPDATA%,
+ * not Claude Code's settings.json). A setup that writes to the wrong file looks
+ * like it worked and silently does nothing, so guessing is not good enough.
+ *
+ * `keyPath` is the nested path to the servers object, which is not always a
+ * single key: ZCode nests it under `mcp.servers`.
  */
-export function hostTargets({ homedir: home = homedir() } = {}) {
+export function hostTargets({ homedir: home = homedir(), appData = process.env.APPDATA } = {}) {
   return {
     zcode: {
       label: 'ZCode',
       kind: 'json',
-      path: join(home, '.zcode', 'settings.json'),
-      // ZCode reads MCP servers from settings.json under "mcpServers"; plugin
-      // installs use .mcp.json instead and do not need this.
-      key: 'mcpServers',
+      // The CLI's own config is the global MCP scope; the desktop app reads it
+      // and migrates it into its protocol layer at startup.
+      path: join(home, '.zcode', 'cli', 'config.json'),
+      keyPath: ['mcp', 'servers'],
     },
     codex: {
       label: 'Codex',
@@ -42,10 +49,14 @@ export function hostTargets({ homedir: home = homedir() } = {}) {
       table: 'mcp_servers',
     },
     claude: {
-      label: 'Claude Code',
+      label: 'Claude Desktop',
       kind: 'json',
-      path: join(home, '.claude', 'settings.json'),
-      key: 'mcpServers',
+      // Documented by the MCP project: %APPDATA%\Claude\claude_desktop_config.json
+      // on Windows, ~/Library/Application Support/Claude on macOS.
+      path: appData
+        ? join(appData, 'Claude', 'claude_desktop_config.json')
+        : join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json'),
+      keyPath: ['mcpServers'],
     },
   };
 }
@@ -66,13 +77,17 @@ export function installInto(host, entry, { dryRun = false, overwrite = false } =
 }
 
 function installJson(host, block, { dryRun, overwrite }) {
+  const keyPath = host.keyPath || [host.key || 'mcpServers'];
+  const empty = nest({}, keyPath, { [SERVER_NAME]: block });
+
   if (!existsSync(host.path)) {
-    // Creating the file would be a guess about its schema. Print instead.
+    // Creating the file would be a guess about its schema beyond the one key we
+    // know. Print instead: the user can paste it into a file they understand.
     return {
       changed: false,
       path: host.path,
       reason: `${host.label} 的配置文件不存在`,
-      preview: JSON.stringify({ [host.key]: { [SERVER_NAME]: block } }, null, 2),
+      preview: JSON.stringify(empty, null, 2),
     };
   }
 
@@ -83,7 +98,7 @@ function installJson(host, block, { dryRun, overwrite }) {
     return { changed: false, path: host.path, reason: `不是合法 JSON，未改动：${err.message}` };
   }
 
-  const existing = raw?.[host.key]?.[SERVER_NAME];
+  const existing = dig(raw, keyPath)?.[SERVER_NAME];
   if (existing && !overwrite) {
     const same = JSON.stringify(existing) === JSON.stringify(block);
     if (same) return { changed: false, path: host.path, reason: '已配置且内容一致' };
@@ -95,13 +110,25 @@ function installJson(host, block, { dryRun, overwrite }) {
     };
   }
 
-  const next = {
-    ...raw,
-    [host.key]: { ...(raw?.[host.key] || {}), [SERVER_NAME]: block },
-  };
+  // Merge only along the key path: everything else in the file is the user's and
+  // must survive byte-for-byte in meaning.
+  const next = nest(raw, keyPath, { [SERVER_NAME]: block });
   const text = `${JSON.stringify(next, null, 2)}\n`;
   if (!dryRun) writeAtomic(host.path, text);
   return { changed: !dryRun, wouldChange: true, path: host.path, preview: text };
+}
+
+// Read a nested value without throwing when an intermediate key is missing.
+function dig(obj, keyPath) {
+  return keyPath.reduce((acc, key) => (acc == null ? acc : acc[key]), obj);
+}
+
+// Set a nested value, copying every level it touches so sibling keys survive.
+function nest(obj, keyPath, leaf) {
+  const [head, ...rest] = keyPath;
+  const branch = (obj?.[head] && typeof obj[head] === 'object') ? obj[head] : {};
+  const merged = rest.length ? nest(branch, rest, leaf) : { ...branch, ...leaf };
+  return { ...(obj || {}), [head]: merged };
 }
 
 function installToml(host, block, { dryRun, overwrite }) {

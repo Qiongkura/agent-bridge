@@ -21,6 +21,36 @@ export function daemonDir() {
   return join(geminiDir(), 'antigravity', 'daemon');
 }
 
+/**
+ * Decide whether the turn being waited on has finished.
+ *
+ * Extracted from `wait()` so the one rule that matters can be tested: text
+ * arriving mid-turn is not an answer. The original condition was
+ * `last && (!busy || sawBusy)`, which is true forever once the first poll saw
+ * RUNNING — so a conversation that emitted any interim text (a tool-call
+ * preamble, a "let me look at that") was cut off and the fragment was returned
+ * as the reply.
+ *
+ * Two ways to be finished:
+ *   * an assistant turn exists and the agent is no longer busy — the answer;
+ *   * the agent is idle, there is no assistant turn, but the turn errored —
+ *     waiting longer cannot help, so surface the error instead of burning the
+ *     whole timeout.
+ *
+ * Everything else keeps polling. In particular `busy === true` with text in
+ * hand is not done.
+ */
+export function turnSettled({ busy, fresh, status }) {
+  const last = (fresh?.turns || []).filter(t => t.role === 'assistant').pop();
+  if (last && !busy) {
+    return { done: true, reply: last, status: status || 'IDLE' };
+  }
+  if (!busy && (fresh?.errors || []).length && (fresh?.turns || []).length && !last) {
+    return { done: true, reply: null, status: status || 'ERROR' };
+  }
+  return { done: false };
+}
+
 // One hub file per running window/version. Only the newest that still answers
 // belongs to the instance the user is driving, so probe newest-first.
 function discover() {
@@ -312,25 +342,19 @@ export class AntigravityBackend extends Backend {
   async wait({ conversationId, fromIndex = 0, timeoutMs = 300000, pollMs = 2500 } = {}) {
     await this.#ensureConnected();
     const deadline = Date.now() + timeoutMs;
-    let sawBusy = false;
     await sleep(Math.min(1500, pollMs));
 
     while (Date.now() < deadline) {
       const status = await this.#rpc('GetCascadeTrajectory', { cascadeId: conversationId });
       const busy = status?.status === 'CASCADE_RUN_STATUS_RUNNING' || status?.status === 'CASCADE_RUN_STATUS_BUSY';
-      if (busy) sawBusy = true;
 
       const stepsData = await this.#rpc('GetCascadeTrajectorySteps', { cascadeId: conversationId });
       const fresh = this.#sinceFrom(this.#normalize(stepsData?.steps), fromIndex);
-      const last = fresh.turns.filter(t => t.role === 'assistant').pop();
-
-      if (last && (!busy || sawBusy)) {
-        return { reply: last, ...fresh, status: status?.status || 'IDLE' };
-      }
-      // An errored conversation never goes busy; bail out instead of burning
-      // the whole timeout.
-      if (!busy && fresh.errors.length && fresh.turns.length && !last) {
-        return { reply: null, ...fresh, status: status?.status || 'ERROR' };
+      const verdict = turnSettled({ busy, fresh, status: status?.status });
+      if (verdict.done) {
+        return verdict.reply
+          ? { reply: verdict.reply, ...fresh, status: verdict.status }
+          : { reply: null, ...fresh, status: verdict.status };
       }
       await sleep(pollMs);
     }

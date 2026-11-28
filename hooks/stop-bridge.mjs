@@ -114,6 +114,9 @@ async function main() {
       role: config.auto.role,
       model: config.autoModel || config.model,
       workspace: cwd,
+      // The host session id, so this window's reviews go to its own conversation
+      // instead of every window sharing one thread.
+      sessionKey: input.session_id || null,
       timeoutMs: config.auto.timeoutMs,
       // A hook is not bound by the host's 30s tool budget, so it may legitimately
       // wait minutes for a real review.

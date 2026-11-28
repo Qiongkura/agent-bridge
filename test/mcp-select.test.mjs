@@ -68,10 +68,20 @@ function connect() {
         clientInfo: { name: 'test', version: '1' },
       });
     },
+    // A tool error arrives as `isError: true` with the message in content, not as
+    // a rejected promise. Checking it here is what makes a broken handler fail
+    // the test instead of being parsed as if it were a result — `bridge_status`
+    // shipped a ReferenceError precisely because nothing asserted this.
     async tool(name, args) {
       const message = await call('tools/call', { name, arguments: args });
+      if (message.error) throw new Error(message.error.message);
       const text = message.result?.content?.[0]?.text;
       assert.ok(text, `tool ${name} returned no content: ${JSON.stringify(message)}`);
+      assert.notEqual(
+        message.result.isError,
+        true,
+        `tool ${name} failed: ${text}`,
+      );
       return JSON.parse(text);
     },
     config() {
@@ -170,6 +180,92 @@ test('a bad model name fails loudly instead of being stored', async () => {
     }).catch(err => ({ error: err.message }));
     assert.ok(result.error, 'a typo must reject');
     assert.deepEqual(mcp.config().bindings, {}, 'nothing was written');
+  } finally {
+    mcp.close();
+  }
+});
+
+test('bridge_status reports without crashing', async () => {
+  // The startup config cache was replaced by a per-call read, and one reference
+  // to the old variable survived. Every other tool worked; this one — the first
+  // place anyone looks when something is wrong — threw immediately. Nothing
+  // called it, so nothing noticed.
+  const mcp = connect();
+  try {
+    await mcp.init();
+    const status = await mcp.tool('bridge_status', {});
+
+    assert.ok(status.path, 'reports where the config lives');
+    assert.ok(Array.isArray(status.agents), 'lists the configured agents');
+    assert.equal(typeof status.defaultBackend, 'string');
+    assert.ok(status.automation, 'reports the automation flags');
+    assert.deepEqual(status.conversationModels, {}, 'no bindings yet');
+    assert.ok(Array.isArray(status.leases));
+  } finally {
+    mcp.close();
+  }
+});
+
+test('bridge_status shows a binding that exists', async () => {
+  const mcp = connect();
+  try {
+    await mcp.init();
+    await mcp.tool('bridge_select', { conversationId: 'conv-A', model: 'gemini 3.8 flash low' });
+
+    const status = await mcp.tool('bridge_status', {});
+    assert.equal(
+      status.conversationModels.antigravity['conv-A'],
+      'MODEL_PLACEHOLDER_M320',
+      'a binding is visible from status, so "why is this thread different" is answerable',
+    );
+  } finally {
+    mcp.close();
+  }
+});
+
+test('bridge_auto toggles and persists', async () => {
+  const mcp = connect();
+  try {
+    await mcp.init();
+    const off = await mcp.tool('bridge_auto', { onStop: false, onError: false, minEdits: 5 });
+    assert.equal(off.onStop, false);
+    assert.equal(off.onError, false);
+
+    // Read back through status rather than the same call's echo: that is the path
+    // the next process would take.
+    const status = await mcp.tool('bridge_status', {});
+    assert.equal(status.automation.onStop, false);
+    assert.equal(status.automation.minEdits, 5);
+  } finally {
+    mcp.close();
+  }
+});
+
+test('bridge_auto does not disturb an existing model binding', async () => {
+  // Two different config keys written by two different tools. A blind write of
+  // the whole config would drop the binding.
+  const mcp = connect();
+  try {
+    await mcp.init();
+    await mcp.tool('bridge_select', { conversationId: 'conv-A', model: 'gemini 3.8 flash low' });
+    await mcp.tool('bridge_auto', { onStop: false });
+
+    assert.equal(mcp.config().bindings['conv-A'], 'MODEL_PLACEHOLDER_M320');
+  } finally {
+    mcp.close();
+  }
+});
+
+test('bridge_models and bridge_agents answer without error', async () => {
+  // They are the other two discovery tools a user hits first. Cheap to cover
+  // here, and an undefined variable in either has the same blast radius.
+  const mcp = connect();
+  try {
+    await mcp.init();
+    const agents = await mcp.tool('bridge_agents', {});
+    assert.ok(Array.isArray(agents.agents));
+    const models = await mcp.tool('bridge_models', {});
+    assert.ok(Array.isArray(models.models));
   } finally {
     mcp.close();
   }

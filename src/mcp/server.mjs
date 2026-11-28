@@ -9,6 +9,7 @@
 // Every waiting path is bounded by the host's ~30s tool budget and returns a
 // ticket when the answer is late; see ../core/session.mjs for why.
 import { createInterface } from 'node:readline';
+import { join } from 'node:path';
 import { loadConfig, updateConfig, defaultDataDir, loadState, saveState, saveStateMerged } from '../core/config.mjs';
 import { loadBackends, describeAll, backendTypes, disposeBackends, resolveTarget } from '../core/registry.mjs';
 import { BridgeError } from '../core/contract.mjs';
@@ -54,6 +55,13 @@ if (firstRun.created) {
 
 function getConfig() {
   return loadConfig({ dataDir: DATA_DIR }).config;
+}
+
+// Safe to call at any time: reports where the config lives, not what was loaded
+// at startup. A stale variable here crashed `bridge_status` — the first tool
+// anyone reaches for — after the startup cache was removed.
+function configPath() {
+  return join(DATA_DIR, 'config.json');
 }
 
 // Re-read, apply the patch, write. `patch` may be a function for the cases where
@@ -105,7 +113,7 @@ tool(
     const available = agents.filter(a => a.connected).map(a => a.id);
 
     return {
-      path: cached.path,
+      path: configPath(),
       caller: CALLER,
       defaultBackend: config.defaultBackend || (available[0] || null),
       available,
@@ -120,6 +128,9 @@ tool(
       },
       selected: config.selections,
       roles: config.roles,
+      // Which model each thread is bound to. Without this, "why is this
+      // conversation using a different model" cannot be answered from status.
+      conversationModels: config.conversationModels || {},
       // A held lease means a collaboration is in flight; seeing one stuck here
       // is the fastest way to diagnose "why does every call say busy".
       leases: activeLeases({ dataDir: DATA_DIR }),
@@ -282,7 +293,7 @@ tool(
     // One write, computed against the freshest config on disk. `updateConfig`
     // re-reads immediately before writing, so a window that edited the config a
     // second ago is not rolled back by this one.
-    const next = await updateConfig((fresh) => {
+    const next = await setConfig((fresh) => {
       const patch = {};
       if (workspace !== undefined) patch.workspace = workspace || null;
       if (target) patch.defaultBackend = target;

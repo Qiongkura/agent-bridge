@@ -6,7 +6,7 @@
 // paths.
 import { BridgeError, truncate } from './contract.mjs';
 import { loadBackends, resolveTarget } from './registry.mjs';
-import { conversationFor, selectionFor, defaultDataDir } from './config.mjs';
+import { conversationFor, resolveModelChoice, modelForConversation, defaultDataDir } from './config.mjs';
 import { checkHop, checkLease, takeLease } from './lease.mjs';
 
 /**
@@ -181,6 +181,12 @@ export async function converse({
   // How long this caller is allowed to block. Omitted means "the MCP soft
   // budget"; hooks pass their own, much larger, limit.
   ceilingMs,
+  // Whether this send is automation (a hook) rather than a user request. Set
+  // explicitly by the hooks. Inferring it from `role` was wrong: `bridge_review`
+  // defaults to the same role the automation uses, so a manual review landed on
+  // the automation model and a user who set a strong model for manual reviews
+  // silently got the cheap one.
+  auto = false,
   context = {},
   state = {},
   onStateChange,
@@ -207,12 +213,15 @@ export async function converse({
   }
 
   // Model names are backend-specific: Antigravity wants an enum, Codex wants a
-  // provider id. So the per-backend selection wins, and the backend itself is
-  // the authority on what a given name means — "claude sonnet low" must resolve
-  // to whatever that agent calls it, or fail loudly.
-  const selection = selectionFor(config, backend.id);
-  let modelRef = model || selection.model || null;
-  if (modelRef) modelRef = await backend.resolveModel(modelRef);
+  // provider id. The backend is the authority on what a given name means, so it
+  // resolves the choice — "claude sonnet low" must become whatever that agent
+  // calls it, or fail loudly rather than silently using its default.
+  //
+  // The first resolution is provisional: it is needed *before* the conversation
+  // is known, because creating one requires a model. A binding on the resulting
+  // conversation is applied below.
+  const hint = resolveModelChoice(config, backend.id, { model, auto });
+  let modelRef = hint ? await backend.resolveModel(hint) : null;
 
   const resolved = await resolveConversation(backend, config, {
     conversationId,
@@ -245,6 +254,14 @@ export async function converse({
   // otherwise the same stale id is tried again on the next call.
   if (resolved.replaced) {
     onRepair?.({ backend: backend.id, role, stale: resolved.replaced, conversationId: resolved.id });
+  }
+
+  // Now that the conversation is known, a model bound to it takes precedence —
+  // that binding is how "this one thread uses a different model" stays scoped to
+  // this thread instead of moving every window that shares the default.
+  const boundModel = modelForConversation(config, backend.id, resolved.id);
+  if (boundModel) {
+    modelRef = await backend.resolveModel(boundModel);
   }
 
   // Count what already exists so wait() can tell new output from history.

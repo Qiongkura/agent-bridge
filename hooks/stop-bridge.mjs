@@ -112,7 +112,10 @@ async function main() {
       target: backend.id,
       prompt,
       role: config.auto.role,
-      model: config.autoModel || config.model,
+      // Automation, explicitly: this is what selects `autoModel` instead of the
+      // interactive model. No `model` argument is passed — `converse` resolves
+      // it, so a model bound to this window's conversation wins, then autoModel.
+      auto: true,
       workspace: cwd,
       // The host session id, so this window's reviews go to its own conversation
       // instead of every window sharing one thread.

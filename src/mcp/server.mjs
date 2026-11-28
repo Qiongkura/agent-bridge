@@ -214,14 +214,15 @@ tool(
 tool(
   'bridge_select',
   '选择协作目标：设定默认代理、默认对话、默认模型，或按用途（review / ask / debug）分别固定。'
-  + '之后发送的内容都会走这些选择。',
+  + '之后发送的内容都会走这些选择。'
+  + '要只给某一个对话单独指定模型，把 conversationId 和 model 一起传——全局默认不会动。',
   {
     type: 'object',
     properties: {
       target: str('默认代理 id（配置里的 backend 名字）。省略则不改'),
       conversationId: str('对话 ID；传空字符串表示新建一个绑定当前工作区的对话'),
       role: str('用途标签，例如 review / ask / debug。省略则设为全局默认'),
-      model: str('模型：可写 id、显示名或枚举'),
+      model: str('模型：可写 id、显示名或枚举。配合 conversationId 时只作用于那个对话'),
       autoModel: str('自动协作（Stop hook）时使用的模型；省略则沿用 model'),
       workspace: str('工作区绝对路径；新建对话时绑定它，让代理能读项目文件'),
       create: bool('为 true 时强制新建对话'),
@@ -249,7 +250,20 @@ tool(
     let resolvedModel = null;
     if (model) {
       resolvedModel = await backend.resolveModel(model);
-      selection.model = resolvedModel;
+      // With a conversation named, the model is bound to *that* conversation and
+      // the global default is left alone. This is the difference between "this
+      // review thread should think harder" and "every window changes model".
+      if (conversationId) {
+        patch.conversationModels = {
+          ...config.conversationModels,
+          [backendId]: {
+            ...((config.conversationModels || {})[backendId] || {}),
+            [conversationId]: resolvedModel,
+          },
+        };
+      } else {
+        selection.model = resolvedModel;
+      }
     }
     if (autoModel) {
       selection.autoModel = await backend.resolveModel(autoModel);
@@ -262,15 +276,26 @@ tool(
       });
       selection.conversationId = created.id;
       patch.selections = { ...config.selections, [backendId]: selection };
+      // A model given alongside `create` belongs to the new conversation, not to
+      // every future one. Without this the caller would have to create the
+      // thread and then edit the global default to make it stick.
+      if (resolvedModel) {
+        patch.conversationModels = {
+          ...config.conversationModels,
+          [backendId]: { ...((config.conversationModels || {})[backendId] || {}), [created.id]: resolvedModel },
+        };
+      }
       if (role) patch.roles = { ...config.roles, [role]: { backend: backendId, conversationId: created.id } };
       const next = setConfig(patch);
       return {
         backend: backendId,
         conversationId: created.id,
         created: true,
-        model: selection.model || null,
+        model: resolvedModel || selection.model || null,
+        modelBoundToConversation: Boolean(resolvedModel),
         workspaces: created.workspaces || [],
         selections: next.selections,
+        conversationModels: next.conversationModels,
       };
     }
 
@@ -286,6 +311,12 @@ tool(
       selections: next.selections,
       roles: next.roles,
       workspace: next.workspace,
+      conversationModels: next.conversationModels,
+      // Say which model this thread will actually use, so a binding that did not
+      // take effect is visible here rather than at the next send.
+      effectiveModel: conversationId
+        ? (next.conversationModels?.[backendId]?.[conversationId] || next.selections?.[backendId]?.model || null)
+        : (next.selections?.[backendId]?.model || null),
     };
   },
 );

@@ -53,7 +53,10 @@ async function main() {
       target: backend.id,
       prompt,
       role: config.auto.role,
-      model: config.autoModel || config.model,
+      // Automation, explicitly, so `autoModel` is chosen rather than the
+      // interactive model. A model bound to this window's conversation still
+      // outranks both.
+      auto: true,
       workspace: cwd,
       sessionKey,
       // Short leash: the user is waiting on the failed tool call, so we take the

@@ -217,7 +217,7 @@ error — so a calling agent can branch on them.
 | `bridge_agents` | Per-agent capabilities: type, online, model, conversation count |
 | `bridge_models` | Available models (with quota) for one agent |
 | `bridge_conversations` | Conversation list (title, time, workspace) |
-| `bridge_select` | Set default agent / conversation / model; `create:true` starts one bound to a workspace |
+| `bridge_select` | Set default agent / conversation / model; with `conversationId` the model binds to that thread only; `create:true` starts one bound to a workspace |
 | `bridge_ask` | Ask and wait (returns a ticket on timeout) |
 | `bridge_review` | Send a completion summary and request review |
 | `bridge_fetch` | Collect a reply; keeps waiting if a prompt is still outstanding |
@@ -393,6 +393,34 @@ MODEL_PLACEHOLDER_M403       enum
 ```
 
 Selections are **stored per backend**: one agent's model name means nothing to another.
+
+### One model per conversation
+
+The default applies to every conversation with that agent. To give one thread its own model — a
+stronger one for a review that must not be rushed — pass `conversationId` together with `model`:
+
+```
+bridge_select({conversationId: "e7de37d6-…", model: "gemini 4 neon medium"})
+```
+
+The model is then bound to that conversation only; **the global default is untouched**, so no other
+window moves. The returned `effectiveModel` is what that thread will actually use, so you can
+confirm the binding took effect.
+
+Precedence, highest first:
+
+| # | Source |
+|---|---|
+| 1 | the model bound to that conversation |
+| 2 | a `model` passed on this call |
+| 3 | `autoModel` for automation, otherwise `model` |
+
+A binding outranks an explicit argument on purpose: the binding *is* an explicit choice, made once
+and meant to stick. If the argument won, every automatic stop-hook review into that thread would
+fall back to the default and the binding would apply only to the call that set it.
+
+`bridge_select({create:true, model:"…"})` binds the model to the conversation it creates, again
+without touching the global default.
 
 ## Choosing a conversation
 

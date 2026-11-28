@@ -210,7 +210,7 @@ ZCode 里的斜杠命令：
 | `bridge_agents` | 每个代理的能力：类型、在线、模型、对话数 |
 | `bridge_models` | 某代理的可用模型（含配额） |
 | `bridge_conversations` | 某代理的对话列表（标题、时间、工作区） |
-| `bridge_select` | 设定默认代理/对话/模型；`create:true` 新建并绑定工作区 |
+| `bridge_select` | 设定默认代理/对话/模型；带 `conversationId` 时模型只绑该对话；`create:true` 新建并绑定工作区 |
 | `bridge_ask` | 提问并等待（超时返回票据） |
 | `bridge_review` | 发送完成总结并请求审查 |
 | `bridge_fetch` | 取回回复；有未答完的提问时自动接着等 |
@@ -384,6 +384,32 @@ MODEL_PLACEHOLDER_M403       枚举名
 ```
 
 模型是**按代理分别保存**的：一个代理的模型名对另一个没有意义。
+
+### 一个对话用一个模型
+
+默认模型对该代理的**所有**对话生效。要给某个对话单独指定——比如某条送审对话要用更强的模型——
+把 `conversationId` 和 `model` 一起传给 `bridge_select`：
+
+```
+bridge_select({conversationId: "e7de37d6-…", model: "gemini 4 neon medium"})
+```
+
+这样模型只绑在那一个对话上，**全局默认不动**，其他窗口的对话不受影响。
+返回值里的 `effectiveModel` 就是该对话实际会用的模型，可以直接确认是否生效。
+
+四条取值路径的优先级（越靠前越优先）：
+
+| 优先级 | 来源 |
+|---|---|
+| 1 | 绑定在该对话上的模型 |
+| 2 | 本次调用显式传的 `model` |
+| 3 | 自动协作时用 `autoModel`，否则用 `model` |
+
+绑定排在显式参数之前是有意的：绑定本身就是一次显式指定，而且要求它**持续生效**。
+如果参数优先，那么每次 Stop hook 自动送审都会掉回默认模型，绑定只在设置它的那一次有效。
+
+`bridge_select({create:true, model:"…"})` 新建对话时会自动把模型绑到新对话上，
+也不会改全局默认。
 
 ## 选对话
 

@@ -227,6 +227,15 @@ export function loadConfig({ dataDir = defaultDataDir(), cwd } = {}) {
 // Version 1 was a single-backend plugin with a flat config. Upgrading users
 // still have that file on disk, so fold the old keys into the new shape instead
 // of silently resetting their choices.
+/**
+ * Fold a v1 config (one backend, flat keys) into the v2 shape.
+ *
+ * The v1 keys must be *removed*, not just read. Leaving them means every
+ * `normalize` call re-applies them, and since `loadConfig` writes the normalized
+ * result back, a stale `model` at the top level overwrites whatever the user sets
+ * under `selections` — a setting that silently reverts on every save, which looks
+ * exactly like the setting being ignored.
+ */
 function migrateLegacy(raw) {
   const auto = { ...(raw.auto || {}) };
   if (raw.autoOnStop !== undefined) auto.onStop = raw.autoOnStop === true;
@@ -246,10 +255,12 @@ function migrateLegacy(raw) {
   const selections = { ...(raw.selections || {}) };
   if (defaultBackend && (raw.conversationId || raw.model || raw.autoModel)) {
     selections[defaultBackend] = {
-      ...(selections[defaultBackend] || {}),
+      // The v2 value wins: a config that has both was already migrated once and
+      // then edited, so the flat key is the stale one.
       ...(raw.conversationId ? { conversationId: raw.conversationId } : {}),
       ...(raw.model ? { model: raw.model } : {}),
       ...(raw.autoModel ? { autoModel: raw.autoModel } : {}),
+      ...(selections[defaultBackend] || {}),
     };
   }
 
@@ -281,6 +292,15 @@ export function normalize(raw) {
     // would hand Antigravity's cascade id to Codex.
     selections,
     roles,
+    // A model bound to one specific conversation, as `{ backend: { convId: model } }`.
+    //
+    // `selections[backend].model` is the default for every conversation with that
+    // agent. When one thread needs a different model — a slow careful one for a
+    // review that must not be rushed — changing the default would silently move
+    // every other window too, and moving them back is a second edit that nobody
+    // remembers to make. Binding the model to the conversation keeps the change
+    // where the user meant it.
+    conversationModels: normalizeConversationModels(raw.conversationModels),
     workspace: raw.workspace || null,
     maxReplyChars: Number(raw.maxReplyChars) || 12000,
     // How many times a prompt may be forwarded before the bridge refuses.
@@ -316,6 +336,53 @@ export function normalize(raw) {
 // Helpers so callers never index `selections` by hand and forget the fallback.
 export function selectionFor(config, backendId) {
   return { ...(config.selections?.[backendId] || {}) };
+}
+
+/**
+ * The model bound to one conversation, or null.
+ *
+ * Deliberately exact-match and per backend: a conversation id is only meaningful
+ * to the agent that issued it, so the same id under two agents is two threads.
+ */
+export function modelForConversation(config, backendId, conversationId) {
+  if (!backendId || !conversationId) return null;
+  return config?.conversationModels?.[backendId]?.[String(conversationId)] || null;
+}
+
+/**
+ * Resolve the model for one call.
+ *
+ * Order is deliberate. A per-conversation binding outranks an explicit argument
+ * because a binding *is* an explicit argument, made once and meant to stick: if
+ * the argument won, every automatic stop-hook review into that thread would drop
+ * back to the default and the binding would apply only to the call that set it.
+ * An explicit argument still outranks the global default, which is what makes a
+ * one-off "use the strong model for this question" work.
+ */
+export function resolveModelChoice(config, backendId, { conversationId, model, auto = false } = {}) {
+  const bound = modelForConversation(config, backendId, conversationId);
+  if (bound) return bound;
+  if (model) return model;
+  const selection = selectionFor(config, backendId);
+  return (auto ? selection.autoModel : null) || selection.model || null;
+}
+
+// Records are keyed by strings; drop anything else so a hand-edited config
+// cannot put an object where a conversation id is expected.
+function normalizeConversationModels(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [backendId, map] of Object.entries(raw)) {
+    if (!map || typeof map !== 'object' || Array.isArray(map)) continue;
+    const inner = {};
+    for (const [conversationId, model] of Object.entries(map)) {
+      if (typeof model === 'string' && model.trim() && conversationId.trim()) {
+        inner[conversationId] = model.trim();
+      }
+    }
+    if (Object.keys(inner).length) out[backendId] = inner;
+  }
+  return out;
 }
 
 export function conversationFor(config, backendId, role) {
